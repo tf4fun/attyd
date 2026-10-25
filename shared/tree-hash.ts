@@ -16,6 +16,7 @@ export const SEGMENT_LENGTH = 4096;
 export const ZERO: Hash = new Uint8Array(32);
 
 const encoder = new TextEncoder();
+const decoder = new TextDecoder("utf-8", { ignoreBOM: true });
 
 function concat(parts: readonly Uint8Array[]): Uint8Array {
   const out = new Uint8Array(parts.reduce((total, part) => total + part.length, 0));
@@ -131,10 +132,6 @@ function isTextBlock(block: unknown): block is { type: "text"; text: string | Te
 }
 
 /** Replaces `holder[key]` by the placeholder of its chain hash. */
-function replaceText(holder: Record<string, unknown>): void {
-  holder.text = `#${base64url(positionHash(holder.text))}`;
-}
-
 function base64url(hash: Uint8Array): string {
   let binary = "";
   for (const byte of hash) binary += String.fromCharCode(byte);
@@ -142,29 +139,34 @@ function base64url(hash: Uint8Array): string {
 }
 
 /** A copy of `value` with each text position of `rule` replaced by `"#" + b64(h(text))`. */
-function withTextHashes(rule: TextRule, value: unknown): unknown {
-  if (rule === "none" || typeof value !== "object" || value === null) return value;
-  const copy = JSON.parse(JSON.stringify(value)) as Record<string, unknown>;
-  const blocks = (holders: unknown, key: string): void => {
-    for (const holder of Array.isArray(holders) ? holders : []) {
+function withTextHashes(rule: TextRule, value: unknown, hashText = (_pointer: string, held: unknown): Hash => positionHash(held)): unknown {
+  if (rule === "none" || typeof value !== "object" || value === null || Array.isArray(value)) return value;
+  const copy = { ...value } as Record<string, unknown>;
+  const blocks = (holders: unknown, key: string, pointer: string): unknown => {
+    if (!Array.isArray(holders)) return holders;
+    return holders.map((holder, index) => {
       const block = (holder as Record<string, unknown> | null)?.[key];
-      if (isTextBlock(block)) replaceText(block as unknown as Record<string, unknown>);
-    }
+      if (!isTextBlock(block)) return holder;
+      return { ...holder, [key]: { ...block, text: `#${base64url(hashText(`${pointer}/${index}/${key}/text`, block.text))}` } };
+    });
   };
   if (rule === "terminal") {
-    if (typeof copy.output === "string" || isTextWindow(copy.output)) copy.output = `#${base64url(positionHash(copy.output))}`;
+    if (typeof copy.output === "string" || isTextWindow(copy.output)) copy.output = `#${base64url(hashText("/output", copy.output))}`;
   } else if (rule === "outputView") {
-    if (typeof copy.text === "string" || isTextWindow(copy.text)) copy.text = `#${base64url(positionHash(copy.text))}`;
+    if (typeof copy.text === "string" || isTextWindow(copy.text)) copy.text = `#${base64url(hashText("/text", copy.text))}`;
   } else if (copy.kind === "message") {
-    blocks(copy.chunks, "content");
+    if (Array.isArray(copy.chunks)) copy.chunks = blocks(copy.chunks, "content", "/chunks");
   } else if (copy.kind === "compaction") {
-    blocks(copy.summary, "content");
+    if (Array.isArray(copy.summary)) copy.summary = blocks(copy.summary, "content", "/summary");
   } else if (copy.kind === "tool") {
-    const content = (copy.call as { content?: unknown } | undefined)?.content;
-    blocks(
-      Array.isArray(content) ? content.filter((item) => (item as { type?: unknown })?.type === "content") : [],
-      "content",
-    );
+    const call = copy.call as Record<string, unknown> | undefined;
+    if (call !== undefined && call !== null && Array.isArray(call.content)) {
+      copy.call = { ...call, content: call.content.map((item, index) => {
+        if (item?.type !== "content" || !isTextBlock(item.content)) return item;
+        return { ...item, content: { ...item.content,
+          text: `#${base64url(hashText(`/call/content/${index}/content/text`, item.content.text))}` } };
+      }) };
+    }
   }
   return copy;
 }
@@ -201,7 +203,61 @@ export function listHash(children: readonly Hash[]): Hash {
   return sha256(concat([encoder.encode("l"), u64be(children.length), ...children]));
 }
 
-const cached = new WeakMap<object, Map<TextRule, Hash>>();
+interface TextChain {
+  /** Start of the last segment, which is the only old segment an append can change. */
+  readonly units: number;
+  readonly bytes: number;
+  readonly before: Hash;
+  readonly hash: Hash;
+}
+
+function continuedText(text: string, seed: TextChain | undefined): TextChain {
+  let units = seed?.units ?? 0;
+  let bytes = seed?.bytes ?? 0;
+  let state = seed?.before ?? ZERO;
+  let lastUnits = units;
+  let lastBytes = bytes;
+  let before = state;
+  for (const segment of segments(text.slice(units))) {
+    lastUnits = units;
+    lastBytes = bytes;
+    before = state;
+    state = chainStep(state, segment);
+    units += decoder.decode(segment).length;
+    bytes += segment.length;
+  }
+  return { units: lastUnits, bytes: lastBytes, before, hash: finish(bytes, state) };
+}
+
+interface ValueMemo {
+  hash?: Hash;
+  readonly chains: Map<string, TextChain>;
+  readonly seed?: ReadonlyMap<string, TextChain>;
+}
+
+const cached = new WeakMap<object, Map<TextRule, ValueMemo>>();
+
+/** Carry only computed chain states through proven text appends. No old value is retained. */
+export function inheritTextHashes(rule: TextRule, before: unknown, after: unknown, paths: readonly string[]): void {
+  if (typeof before !== "object" || before === null || typeof after !== "object" || after === null ||
+      !Object.isFrozen(before) || !Object.isFrozen(after)) return;
+  const previous = cached.get(before)?.get(rule);
+  const seed = previous?.hash === undefined ? previous?.seed : previous.chains;
+  if (seed === undefined) return;
+  // A generic JSON string append is not necessarily a protocol text position.
+  const positions = new Set<string>();
+  withTextHashes(rule, before, (pointer, held) => {
+    if (typeof held === "string") positions.add(pointer);
+    return ZERO;
+  });
+  if (!paths.every((path) => positions.has(path))) return;
+  let byRule = cached.get(after);
+  if (byRule === undefined) {
+    byRule = new Map();
+    cached.set(after, byRule);
+  }
+  byRule.set(rule, { chains: new Map(), seed });
+}
 
 /**
  * `valueHash` remembered by the identity of the value, which a replica freezes: a value that did
@@ -214,10 +270,20 @@ export function cachedValueHash(rule: TextRule, value: unknown): Hash {
     byRule = new Map();
     cached.set(value, byRule);
   }
-  let hash = byRule.get(rule);
-  if (hash === undefined) {
-    hash = valueHash(rule, value);
-    byRule.set(rule, hash);
+  let memo = byRule.get(rule);
+  if (memo === undefined) {
+    memo = { chains: new Map() };
+    byRule.set(rule, memo);
   }
-  return hash;
+  if (memo.hash === undefined) {
+    const held = memo;
+    const replaced = withTextHashes(rule, value, (pointer, text) => {
+      if (typeof text !== "string") return positionHash(text);
+      const chain = continuedText(text, held.seed?.get(pointer));
+      held.chains.set(pointer, chain);
+      return chain.hash;
+    });
+    memo.hash = sha256(concat([encoder.encode("v"), encoder.encode(canonicalJson(replaced))]));
+  }
+  return memo.hash;
 }

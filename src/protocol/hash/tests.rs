@@ -85,6 +85,27 @@ fn appending_changes_only_the_last_segment_and_the_chain_after_it() {
 }
 
 #[test]
+fn a_cached_chain_continues_unicode_appends_and_answers_window_boundaries() {
+    for initial in [String::new(), "x".repeat(L), format!("{}{}", "x".repeat(L - 1), "日😀".repeat(3000))] {
+        let mut text = initial;
+        let mut chain = TextChain::continued(&text, None);
+        for suffix in ["", "a", "日😀", &"z".repeat(2 * L + 1)] {
+            text.push_str(suffix);
+            chain = TextChain::continued(&text, Some(&chain));
+            assert_eq!(chain.hash(), text_hash(&text));
+            for bytes in [L, L + 1, 3 * L] {
+                assert_eq!(super::super::window::window_cached(&text, bytes, &chain), super::super::window::window(&text, bytes));
+            }
+            for (index, segment) in segments(&text).enumerate() {
+                let (start, end, before) = chain.segment(index).unwrap();
+                assert_eq!(&text[start..end], segment);
+                assert_eq!(before, super::super::window::state_before(&text, start));
+            }
+        }
+    }
+}
+
+#[test]
 fn the_length_is_part_of_the_hash() {
     // The same segment chain with another length is another text.
     let state = chain_states("abc");

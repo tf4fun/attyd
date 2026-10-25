@@ -136,7 +136,13 @@ fn output_view(tree: &Tree, session: &str, turn: Option<&Node>) -> Spec {
     let Some(turn) = turn else {
         return output_spec(json!({ "turn": null, "entry": null, "other": 0 }), String::new());
     };
-    let head = head(turn).clone();
+    let (text, other) = output_entry(tree, session, turn)
+        .and_then(Node::as_value)
+        .map_or((String::new(), 0), |(entry, _)| output_text(entry));
+    output_from_head(head(turn), text, other)
+}
+
+fn output_from_head(head: &Value, text: String, other: u64) -> Spec {
     let summary = {
         let mut summary = Map::new();
         for key in ["historyRev", "start", "messageId", "state"] {
@@ -147,10 +153,6 @@ fn output_view(tree: &Tree, session: &str, turn: Option<&Node>) -> Spec {
         Value::Object(summary)
     };
     let entry = head["output"].as_u64();
-    let (text, other) = entry
-        .and_then(|index| tree.get(&format!("/sessions/{}/entries/{index}", escape(session))))
-        .and_then(Node::as_value)
-        .map_or((String::new(), 0), |(entry, _)| output_text(entry));
     output_spec(json!({ "turn": summary, "entry": entry, "other": other }), text)
 }
 
@@ -176,6 +178,7 @@ fn turn_view(tree: &Tree, session: &str, turn: &Node) -> Spec {
 struct Built {
     head: Arc<Value>,
     entry: Option<Arc<Value>>,
+    entry_rev: u64,
     spec: Spec,
 }
 
@@ -213,9 +216,10 @@ fn cached_output(tree: &Tree, session: &str, view: &View, turn: Option<&Node>, c
     let Some(head_arc) = turn.value_arc() else {
         return output_view(tree, session, Some(turn));
     };
-    let entry_arc = output_entry(tree, session, turn).and_then(Node::value_arc);
+    let entry = output_entry(tree, session, turn);
+    let entry_arc = entry.and_then(Node::value_arc);
     if let Some(built) = cache.0.get(view)
-        && Arc::ptr_eq(&built.head, &head_arc)
+        && (Arc::ptr_eq(&built.head, &head_arc) || same_output_head(&built.head, &head_arc))
         && match (&built.entry, &entry_arc) {
             (Some(held), Some(now)) => Arc::ptr_eq(held, now),
             (None, None) => true,
@@ -224,9 +228,48 @@ fn cached_output(tree: &Tree, session: &str, view: &View, turn: Option<&Node>, c
     {
         return built.spec.clone();
     }
-    let spec = output_view(tree, session, Some(turn));
-    cache.0.insert(view.clone(), Built { head: head_arc, entry: entry_arc, spec: spec.clone() });
+    let spec = cache.0.get(view).and_then(|built| {
+        // A new output or installed history starts afresh. For appends to the same entry,
+        // the tree's text history proves which suffix grew; do not concatenate all blocks again.
+        if built.head["historyRev"] != head_arc["historyRev"] || built.head["output"] != head_arc["output"] {
+            return None;
+        }
+        let (text, other) = appended_output(built, entry?)?;
+        Some(output_from_head(&head_arc, text, other))
+    }).unwrap_or_else(|| output_view(tree, session, Some(turn)));
+    cache.0.insert(view.clone(), Built { head: head_arc, entry: entry_arc, entry_rev: entry.map_or(0, Node::rev), spec: spec.clone() });
     spec
+}
+
+fn same_output_head(before: &Value, after: &Value) -> bool {
+    ["historyRev", "start", "messageId", "state", "output"].iter().all(|key| before[*key] == after[*key])
+}
+
+/// An unchanged prefix plus the appended suffix of the last text block. An append to an
+/// earlier block, a new block, an edit or a replacement uses the ordinary full projection.
+fn appended_output(built: &Built, entry: &Node) -> Option<(String, u64)> {
+    let history = entry.text_history();
+    if history.replaced > built.entry_rev {
+        return None;
+    }
+    let old = built.entry.as_ref()?;
+    let (_, lengths) = history.lengths.back()?;
+    let ((last, length), prefix) = lengths.split_last()?;
+    if prefix.iter().any(|(pointer, length)| old.pointer(pointer).and_then(Value::as_str).map(str::len) != Some(*length as usize)) {
+        return None;
+    }
+    let previous = old.pointer(last)?.as_str()?;
+    if *length < previous.len() as u64 {
+        return None;
+    }
+    let (current, _) = entry.as_value()?;
+    let suffix = current.pointer(last)?.as_str()?.get(previous.len()..)?;
+    let Spec::Value(value, _) = &built.spec else { return None };
+    let held = value["text"].as_str()?;
+    let mut text = String::with_capacity(held.len() + suffix.len());
+    text.push_str(held);
+    text.push_str(suffix);
+    Some((text, value["other"].as_u64()?))
 }
 
 /// The node of the entry that holds the output of the turn with head `turn`, if it has one.

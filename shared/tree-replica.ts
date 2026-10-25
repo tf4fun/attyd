@@ -17,7 +17,7 @@ import { wire, type Hash } from "./digest";
 import { PatchError, applyOps } from "./patch";
 import type { Op } from "./protocol";
 import { shapeAt } from "./tree-shape";
-import { SEGMENT_LENGTH, cachedValueHash, isTextWindow, listHash, mapHash, objectHash } from "./tree-hash";
+import { SEGMENT_LENGTH, cachedValueHash, inheritTextHashes, isTextWindow, listHash, mapHash, objectHash, type TextRule } from "./tree-hash";
 
 // ---------------------------------------------------------------------------
 // The events (design §6.2, §6.3)
@@ -245,11 +245,42 @@ function applyChange(
     // A window of a followed path holds fewer than N + L bytes of text: more is the bridge's error, and
     // the memory a small client reserved for it is not the replica's to spend.
     if (windowExceeded(value, window)) return resubscribe("a text window of N + L bytes or more", true);
+    inheritAppendedHashes(tokensOf(path), held.value, value, change.ops);
   } catch (error) {
     if (error instanceof PatchError) return resubscribe(error.message, false);
     throw error;
   }
   return { kind: "applied", replica: { ...held, value, version: rev } };
+}
+
+/** Transfer chain prefixes only for an event made entirely of text appends. Walking its
+ * changed paths finds the value nodes without traversing the rest of a long session. */
+function inheritAppendedHashes(root: readonly string[], before: unknown, after: unknown, ops: readonly Op[]): void {
+  if (ops.length === 0 || !ops.every((op) => op.op === "append" && "text" in op)) return;
+  const values = new Map<object, { rule: TextRule; before: unknown; paths: string[] }>();
+  for (const op of ops) {
+    const relative = tokensOf(op.path);
+    let old = before;
+    let current = after;
+    for (let depth = 0; depth <= relative.length; depth += 1) {
+      const shape = shapeAt([...root, ...relative.slice(0, depth)]);
+      if (shape?.kind === "value") {
+        if (typeof current !== "object" || current === null) break;
+        let changed = values.get(current);
+        if (changed === undefined) {
+          changed = { rule: shape.rule, before: old, paths: [] };
+          values.set(current, changed);
+        }
+        changed.paths.push(relative.slice(depth).map((token) => `/${escape(token)}`).join(""));
+        break;
+      }
+      const key = relative[depth];
+      if (key === undefined || typeof old !== "object" || old === null || typeof current !== "object" || current === null) break;
+      old = (old as Record<string, unknown>)[key];
+      current = (current as Record<string, unknown>)[key];
+    }
+  }
+  for (const [value, changed] of values) inheritTextHashes(changed.rule, changed.before, value, changed.paths);
 }
 
 function applyCheck(held: PathReplica | undefined, check: Check): Applied {

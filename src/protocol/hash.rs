@@ -79,6 +79,52 @@ pub(crate) fn text_hash(text: &str) -> Hash {
     finish(text.len() as u64, &chain_states(text).last().copied().unwrap_or(ZERO))
 }
 
+/// A computed chain, retained across proven appends. The final segment may grow, so only
+/// segments before it are reused. No old text or old tree is retained by this cache.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TextChain {
+    ends: Vec<usize>,
+    states: Vec<Hash>,
+}
+
+impl TextChain {
+    /// `prefix` is valid only when the caller proved the text has only been appended to.
+    pub(crate) fn continued(text: &str, prefix: Option<&Self>) -> Self {
+        let mut chain = prefix.cloned().unwrap_or_default();
+        chain.ends.pop();
+        chain.states.pop();
+        let mut offset = chain.ends.last().copied().unwrap_or(0);
+        let mut state = chain.states.last().copied().unwrap_or(ZERO);
+        for segment in segments(&text[offset..]) {
+            offset += segment.len();
+            state = chain_step(&state, segment);
+            chain.ends.push(offset);
+            chain.states.push(state);
+        }
+        chain
+    }
+
+    pub(crate) fn hash(&self) -> Hash {
+        finish(self.ends.last().copied().unwrap_or(0) as u64, self.states.last().unwrap_or(&ZERO))
+    }
+
+    /// The segment boundaries before `length` are also those of any appended version.
+    pub(crate) fn window_offset(&self, length: usize, bytes: usize) -> usize {
+        let boundary = self.ends.partition_point(|end| *end <= length.saturating_sub(bytes));
+        boundary.checked_sub(1).map_or(0, |index| self.ends[index])
+    }
+
+    pub(crate) fn before(&self, offset: usize) -> Hash {
+        if offset == 0 { ZERO } else { self.states[self.ends.binary_search(&offset).expect("a segment boundary")] }
+    }
+
+    pub(crate) fn segment(&self, index: usize) -> Option<(usize, usize, Hash)> {
+        let end = *self.ends.get(index)?;
+        let start = index.checked_sub(1).map_or(0, |previous| self.ends[previous]);
+        Some((start, end, self.before(start)))
+    }
+}
+
 /// The hash of a text of `length` bytes of which a client holds the tail `text`, starting at a
 /// segment boundary whose chain state is `before`. It equals `text_hash` of the whole text.
 pub(crate) fn window_hash(before: &Hash, length: u64, text: &str) -> Hash {
@@ -161,13 +207,42 @@ pub(crate) fn text_pointers(rule: TextRule, value: &Value) -> Vec<String> {
 /// `h = H("v" ‖ canon(value'))`: `value'` is the value with each text position replaced by
 /// `"#"` and the unpadded base64url of that text's hash.
 pub(crate) fn value_hash(rule: TextRule, value: &Value) -> Hash {
-    let pointers = text_pointers(rule, value);
-    let mut replaced = value.clone();
-    for pointer in pointers {
-        let text = replaced.pointer_mut(&pointer).expect("a text position exists");
-        let hash = text_hash(text.as_str().expect("a text position is a string"));
-        *text = Value::String(format!("#{}", URL_SAFE_NO_PAD.encode(hash)));
+    value_hash_with(rule, value, |_, text| text_hash(text))
+}
+
+/// Clone only the JSON around text positions; their potentially large strings are replaced
+/// before copying. This is shared by hashes and window snapshots.
+pub(crate) fn map_text(rule: TextRule, value: &Value, mut replace: impl FnMut(&str, &str) -> Value) -> Value {
+    fn copy(value: &Value, path: &str, replacements: &mut std::collections::BTreeMap<String, Value>) -> Value {
+        if let Some(replaced) = replacements.remove(path) {
+            return replaced;
+        }
+        if !replacements.keys().any(|key| key.strip_prefix(path).is_some_and(|rest| rest.starts_with('/'))) {
+            return value.clone();
+        }
+        match value {
+            Value::Array(items) => Value::Array(items.iter().enumerate().map(|(index, item)| {
+                copy(item, &format!("{path}/{index}"), replacements)
+            }).collect()),
+            Value::Object(fields) => Value::Object(fields.iter().map(|(key, value)| {
+                let pointer = super::diff::child(path, key);
+                (key.clone(), copy(value, &pointer, replacements))
+            }).collect()),
+            _ => value.clone(),
+        }
     }
+    let mut replacements = text_pointers(rule, value).into_iter().map(|pointer| {
+        let text = value.pointer(&pointer).and_then(Value::as_str).expect("a text position is a string");
+        let replacement = replace(&pointer, text);
+        (pointer, replacement)
+    }).collect();
+    copy(value, "", &mut replacements)
+}
+
+pub(crate) fn value_hash_with(rule: TextRule, value: &Value, mut hash_text: impl FnMut(&str, &str) -> Hash) -> Hash {
+    let replaced = map_text(rule, value, |pointer, text| {
+        Value::String(format!("#{}", URL_SAFE_NO_PAD.encode(hash_text(pointer, text))))
+    });
     let mut hasher = Sha256::new();
     hasher.update(b"v");
     hasher.update(canonical_json(&replaced));

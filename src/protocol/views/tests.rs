@@ -300,3 +300,37 @@ fn an_output_view_whose_inputs_did_not_change_is_not_built_again() {
     commit(&mut world, &mut cache).unwrap();
     assert_eq!(world.view(LATEST)["text"], "hello there");
 }
+
+#[test]
+fn a_cached_output_appends_its_last_block_and_rebuilds_when_the_blocks_or_output_change() {
+    let mut world = World::new();
+    world.wanted.insert(latest());
+    let mut cache = ViewCache::default();
+    let commit = |world: &mut World, cache: &mut ViewCache| {
+        let root = world.projector.project(&world.registry, &agent(), 1, world.tree.rev() + 1);
+        let wanted = world.wanted.clone();
+        world.tree.commit_with_views(root, |tree| derive_cached(tree, &wanted, cache));
+    };
+    let chunk = |part, body: &str| json!({ "sessionUpdate": "agent_message_chunk", "messageId": "a",
+        "content": { "type": "text", "text": body, "_meta": { "part": part } } });
+    let prefix = "x".repeat(8192);
+    world.update(chunk(0, &prefix)).update(chunk(1, "tail"));
+    commit(&mut world, &mut cache);
+    let previous = world.tree.get(LATEST).unwrap().value_arc().unwrap();
+    world.update(chunk(1, " appended"));
+    commit(&mut world, &mut cache);
+    assert_eq!(previous["text"], format!("{prefix}tail"), "published values remain immutable");
+    assert_eq!(world.view(LATEST)["text"], format!("{prefix}tail appended"));
+    world.update(chunk(2, " new block"));
+    commit(&mut world, &mut cache);
+    assert_eq!(world.view(LATEST)["text"], format!("{prefix}tail appended new block"));
+    world.update(json!({ "sessionUpdate": "tool_call", "toolCallId": "t", "title": "tool" }));
+    commit(&mut world, &mut cache);
+    let held = world.tree.get(LATEST).unwrap().value_arc().unwrap();
+    world.update(json!({ "sessionUpdate": "tool_call_update", "toolCallId": "t", "status": "completed" }));
+    commit(&mut world, &mut cache);
+    assert!(Arc::ptr_eq(&held, &world.tree.get(LATEST).unwrap().value_arc().unwrap()));
+    world.update(text("agent_message_chunk", "b", "new output"));
+    commit(&mut world, &mut cache);
+    assert_eq!(world.view(LATEST)["text"], "new output");
+}

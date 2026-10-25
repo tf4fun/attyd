@@ -5,7 +5,7 @@ use std::sync::Arc;
 use serde_json::json;
 
 use super::*;
-use crate::protocol::hash::{Hash, L};
+use crate::protocol::hash::{Hash, L, ZERO};
 use crate::protocol::tree::Spec;
 
 const PATH: &str = "/s/entries/0/chunks/0/content/text";

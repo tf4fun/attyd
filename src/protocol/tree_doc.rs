@@ -241,7 +241,7 @@ pub(crate) const OP_LOG: usize = 64;
 struct TargetLog {
     /// The `op.id` the target showed at the last commit; none before the first.
     last: Option<String>,
-    records: std::collections::VecDeque<OpRecord>,
+    records: std::collections::VecDeque<(OpRecord, Arc<Value>)>,
 }
 
 /// How many failed loads `/global/loadFailures` keeps (design §6.2).
@@ -312,22 +312,28 @@ impl Projector {
         if let Some(last) = &log.last
             && *last != operation.id
         {
-            log.records.push_back(OpRecord {
+            let record = OpRecord {
                 id: operation.id.clone(),
                 after: Some(last.clone()),
                 kind: operation.kind,
                 rev: next_rev,
                 status: operation.status,
-                error: None,
-            });
+                error: operation.error.as_ref().map(ErrorSummary::of),
+            };
+            let published = Arc::new(serde_json::to_value(&record).expect("an operation record serializes"));
+            log.records.push_back((record, published));
             while log.records.len() > OP_LOG {
                 log.records.pop_front();
             }
         }
         log.last = Some(operation.id.clone());
-        if let Some(record) = log.records.iter_mut().rev().find(|record| record.id == operation.id) {
-            record.status = operation.status;
-            record.error = operation.error.as_ref().map(ErrorSummary::of);
+        if let Some((record, published)) = log.records.back_mut().filter(|(record, _)| record.id == operation.id) {
+            let error = operation.error.as_ref().map(ErrorSummary::of);
+            if record.status != operation.status || record.error != error {
+                record.status = operation.status;
+                record.error = error;
+                *published = Arc::new(serde_json::to_value(&record).expect("an operation record serializes"));
+            }
         }
     }
 
@@ -338,7 +344,7 @@ impl Projector {
                 .get(target)
                 .into_iter()
                 .flat_map(|log| log.records.iter())
-                .map(value)
+                .map(|(_, published)| Spec::text_value(Arc::clone(published), TextRule::None))
                 .collect(),
         )
     }
@@ -478,3 +484,6 @@ pub(crate) fn project_tree(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod perf_tests;

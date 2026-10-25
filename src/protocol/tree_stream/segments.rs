@@ -3,7 +3,7 @@
 //! `before` or the text's hash.
 use serde::Serialize;
 
-use super::super::hash::{self, TextRule, ZERO};
+use super::super::hash::{self, TextRule};
 use super::super::tree::Tree;
 use super::super::window::state_wire;
 use super::windowed_ops::{locate, pointer};
@@ -46,15 +46,14 @@ pub(crate) fn read_segment(tree: &Tree, path: &str, index: usize, at: u64) -> Se
         return SegmentRead::NotFound;
     }
     let text = value.pointer(&position).and_then(serde_json::Value::as_str).expect("a text position");
-    let segments: Vec<&str> = hash::segments(text).collect();
-    let Some(segment) = segments.get(index) else { return SegmentRead::NotFound };
+    let chain = node.text_chain(&position).expect("a text chain");
+    let Some((start, end, before)) = chain.segment(index) else { return SegmentRead::NotFound };
     let history = node.text_history();
     if history.replaced > at {
         return SegmentRead::Stale;
     }
     if node.rev() > at {
         // Only appended to since: the segment is as it was if it was complete at `at`.
-        let end: usize = segments[..=index].iter().map(|segment| segment.len()).sum();
         let length_at = history
             .lengths
             .iter()
@@ -66,8 +65,7 @@ pub(crate) fn read_segment(tree: &Tree, path: &str, index: usize, at: u64) -> Se
             return SegmentRead::Stale;
         }
     }
-    let before = segments[..index].iter().fold(ZERO, |state, segment| hash::chain_step(&state, segment));
-    SegmentRead::Segment(Segment { before: state_wire(&before), segment: (*segment).to_string() })
+    SegmentRead::Segment(Segment { before: state_wire(&before), segment: text[start..end].to_string() })
 }
 
 #[cfg(test)]

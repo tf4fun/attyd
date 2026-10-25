@@ -41,6 +41,35 @@ fn the_first_commit_is_revision_one_and_an_unchanged_one_is_none() {
 }
 
 #[test]
+fn text_hashes_and_windows_stay_correct_across_append_batches_edits_and_retained_trees() {
+    let mut tree = Tree::new("i");
+    let mut text = format!("{}{}", "x".repeat(hash::L - 1), "日😀".repeat(2000));
+    let commit = |tree: &mut Tree, text: &str| {
+        tree.commit(BTreeMap::from([("output".into(), Spec::text_value(Arc::new(json!({ "text": text })), TextRule::OutputView))]));
+    };
+    commit(&mut tree, &text);
+    let original = tree.clone();
+    let original_hash = tree.get("/output").unwrap().hash();
+    for suffix in ["one", "日", "😀", "two"] {
+        text.push_str(suffix);
+        commit(&mut tree, &text);
+    }
+    for replace in [false, true] {
+        if replace {
+            text.replace_range(0..1, "y");
+            commit(&mut tree, &text);
+            text.push_str(" after edit");
+            commit(&mut tree, &text);
+        }
+        let node = tree.get("/output").unwrap();
+        let value = json!({ "text": text });
+        assert_eq!(node.hash(), hash::value_hash(TextRule::OutputView, &value));
+        assert_eq!(node.to_value_windowed(hash::L), crate::protocol::window::window_value(TextRule::OutputView, &value, hash::L));
+    }
+    assert_eq!(original.get("/output").unwrap().hash(), original_hash);
+}
+
+#[test]
 fn one_commit_changing_several_paths_is_one_revision() {
     let mut tree = Tree::new("i");
     tree.commit(root(&[("s", session("t", &["a"]))]));

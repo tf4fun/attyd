@@ -673,8 +673,12 @@ values of the Agent's size, so a device that cannot hold them does not offer ans
 Peak memory claims are to be measured, not assumed: plan step 8 runs a minimal reference
 client through receive, parse, verify and install, and records its peak.
 
-The bridge keeps per node `rev`, `srev` and a cached hash, per materialized view its value
-(text shared with the entry where it is one block), and per target `K` small records.
+The bridge keeps per node `rev`, `srev` and a cached hash, per materialized view its owned
+JSON value, and per target `K` small records. Computed text chains retain segment boundaries
+and chain states across appends, not copies of prior bodies; windows and segment reads reuse
+them. An output view's immutable string still copies the existing output when it grows,
+even for a single-block entry. The projection still scans entries and the turn index;
+these caches do not make a complete bridge commit constant-time.
 
 ## 12. Alternatives considered
 

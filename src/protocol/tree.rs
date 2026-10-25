@@ -111,6 +111,10 @@ pub(crate) struct Node {
     hash: OnceLock<Hash>,
     /// For a value node with text positions.
     text: TextHistory,
+    /// Computed on a hash/window read, shared when unchanged. Across appends the seed is the
+    /// most recently computed chain, not a linked list of prior node versions.
+    chains: Option<Arc<OnceLock<BTreeMap<String, hash::TextChain>>>>,
+    chain_seed: Option<Arc<OnceLock<BTreeMap<String, hash::TextChain>>>>,
 }
 
 impl Node {
@@ -215,7 +219,7 @@ impl Node {
         use super::tree_stream::snapshot::Shape;
         match &self.body {
             Body::Value(value, rule) => Shape::Value(match window {
-                Some(bytes) => super::window::window_value(*rule, value, bytes),
+                Some(bytes) => self.windowed_value(*rule, value, bytes),
                 None => (**value).clone(),
             }),
             Body::Object { fields, children } => Shape::Object(
@@ -236,7 +240,7 @@ impl Node {
     /// `to_value`, with the text positions held as windows of `window` bytes.
     pub(crate) fn to_value_windowed(&self, window: usize) -> Value {
         match &self.body {
-            Body::Value(value, rule) => super::window::window_value(*rule, value, window),
+            Body::Value(value, rule) => self.windowed_value(*rule, value, window),
             Body::Object { fields, children } => {
                 let mut object = fields.clone();
                 for (key, child) in children {
@@ -405,7 +409,17 @@ impl Node {
             (Some(old), Body::Value(..)) if same => old.hash.clone(),
             _ => OnceLock::new(),
         };
-        Node { rev: own, srev, body, hash, text }
+        let (chains, chain_seed) = if text.lengths.is_empty() {
+            (None, None)
+        } else if let Some(old) = old.filter(|_| same) {
+            (old.chains.clone(), old.chain_seed.clone())
+        } else {
+            let seed = old.filter(|old| text.replaced <= old.rev).and_then(|old| {
+                old.chains.as_ref().filter(|chains| chains.get().is_some()).cloned().or_else(|| old.chain_seed.clone())
+            });
+            (Some(Arc::new(OnceLock::new())), seed)
+        };
+        Node { rev: own, srev, body, hash, text, chains, chain_seed }
     }
 
     /// The text history of a value node that has just taken `value`: whether the ops that made
@@ -450,6 +464,25 @@ impl Node {
     /// The text history of a value node.
     pub(crate) fn text_history(&self) -> &TextHistory {
         &self.text
+    }
+
+    pub(crate) fn text_chain(&self, pointer: &str) -> Option<&hash::TextChain> {
+        self.chains.as_ref()?.get_or_init(|| {
+            let (value, rule) = self.as_value().expect("text chains belong to a value");
+            let seed = self.chain_seed.as_ref().and_then(|cache| cache.get());
+            hash::text_pointers(rule, value).into_iter().map(|pointer| {
+                let text = value.pointer(&pointer).and_then(Value::as_str).expect("a text position");
+                let chain = hash::TextChain::continued(text, seed.and_then(|seed| seed.get(&pointer)));
+                (pointer, chain)
+            }).collect()
+        }).get(pointer)
+    }
+
+    fn windowed_value(&self, rule: TextRule, value: &Value, bytes: usize) -> Value {
+        hash::map_text(rule, value, |pointer, text| {
+            serde_json::to_value(super::window::window_cached(text, bytes, self.text_chain(pointer).expect("a text chain")))
+                .expect("a window serializes")
+        })
     }
 
     /// A child at `path`: reconciled with its old node when that is of the same kind, else
@@ -534,7 +567,9 @@ impl Node {
     /// map or list over its children's hashes.
     pub(crate) fn hash(&self) -> Hash {
         *self.hash.get_or_init(|| match &self.body {
-            Body::Value(value, rule) => hash::value_hash(*rule, value),
+            Body::Value(value, rule) => hash::value_hash_with(*rule, value, |pointer, _| {
+                self.text_chain(pointer).expect("a text chain").hash()
+            }),
             Body::Object { fields, children } => hash::object_hash(
                 fields,
                 children.iter().map(|(name, node)| (name.as_str(), node.hash())),
@@ -604,6 +639,8 @@ impl Tree {
                 body: Body::Map(BTreeMap::new()),
                 hash: OnceLock::new(),
                 text: TextHistory::default(),
+                chains: None,
+                chain_seed: None,
             },
         }
     }
