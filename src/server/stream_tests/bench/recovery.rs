@@ -168,7 +168,7 @@ async fn until_ready_again(stream: &mut Watch) {
 }
 
 #[tokio::test]
-async fn after_an_agent_eof_reads_serve_the_last_documents_and_a_global_stream_restarts_nothing() {
+async fn after_an_agent_eof_global_and_catalog_reads_serve_the_last_documents_without_restarting() {
     let (server, link) = Bench::start(json!({})).await;
     let mut stream = server.watch("scope=global&scope=catalog").await;
     stream.event().await;
@@ -181,11 +181,8 @@ async fn after_an_agent_eof_reads_serve_the_last_documents_and_a_global_stream_r
     assert_eq!(
         server.agents.accepted(),
         1,
-        "neither a read nor a global stream starts a connection"
+        "neither global/catalog reads nor their streams start a connection"
     );
-    let (status, body) = server.read_document("session/unheld").await;
-    not_found(status, &body, "an unheld session");
-    assert_eq!(server.agents.accepted(), 1);
 }
 
 /// Q2: a successful terminal login refreshes the connection. With only a global stream open,

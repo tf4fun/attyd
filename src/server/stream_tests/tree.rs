@@ -3,6 +3,8 @@
 
 use super::*;
 
+mod late_demand;
+
 /// The next event that has `changes` or `check`, as a whole.
 async fn next(sse: &mut Sse) -> Value {
     event(sse, WAIT).await.expect("an event")

@@ -76,6 +76,17 @@ Revision 4 review boundaries (#216) have these concrete gates in addition to S1â
 | A cold polling read sends the directory as `cwd`, without the stream query's session prefix | `tests/reference-client.test.ts` |
 | A non-node `follow` or `GET` is refused before observing or loading its session | `server::stream_tests::tree::non_node_paths_are_refused_before_a_session_is_loaded_or_observed` |
 
+Late session demand after EOF (#224, P1-1) is covered by
+`server::stream_tests::tree::late_demand`, over real HTTP and a scripted ACP Agent:
+
+| Boundary | Gate |
+| --- | --- |
+| With no session observed at EOF, a later session or view stream/read starts the next connection and receives replayed content | The four `a_session_*` / `a_view_*_after_unobserved_eof_starts_and_loads_the_next_connection` cases wait for the old runtime's input to be gone before registering demand |
+| Concurrent late streams and reads share one connection and one load | `concurrent_late_streams_and_reads_share_one_connection_and_one_load` |
+| A short output read retains its load demand and cwd through connection backoff, even after a second operation read supplies no cwd and both HTTP bodies have ended | `late_short_reads_keep_the_first_directory_and_demand_through_connection_backoff` |
+| Global/catalog reads and streams alone do not start a connection | `late_global_and_catalog_reads_and_streams_do_not_start_a_connection` |
+| An unheld session followed without cwd ends with `load_failed` / `invalid_request`, without sending `session/load` | `a_late_session_stream_without_cwd_ends_instead_of_waiting_forever` |
+
 The reference client's memory figures count UTF-8 window text, not the actual heap used
 by parsed JSON and replica copies. View polling below the 30-second `VIEW_LINGER` can
 receive `unchanged`; after eviction it receives a full snapshot again. These are the

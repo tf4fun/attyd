@@ -201,15 +201,15 @@ impl BridgeHub {
         }
     }
 
-    /// Whether an open v2 stream needs a connection: it follows a session
-    /// scope that has not ended (S6, Q2). Global and catalog alone do not.
+    /// Whether a followed session or a pending session read needs a connection
+    /// (B6, Q2). Global and catalog alone do not.
     fn streams_need_connection(&self) -> bool {
         let published = self.publication.lock();
         !published.feed.followed_sessions().is_empty()
     }
 
-    /// Schedules the one recovery task when no generation runs and a stream
-    /// or a login needs the next connection. GET never calls it.
+    /// Schedules the one recovery task when no generation runs and a session
+    /// stream, a pending read or a login needs the next connection.
     async fn recover(self: &Arc<Self>) {
         let (token, delay) = {
             let mut state = self.state.lock().await;
@@ -279,12 +279,15 @@ impl BridgeHub {
         Ok(())
     }
 
-    /// Asks the current generation to serve the streams: a subscription of the
-    /// revision 3 feed may follow a session the bridge has to load. With no
-    /// generation, the next one serves them when it is ready.
-    async fn serve_streams(&self) {
-        if let Some(input) = &self.state.lock().await.input {
+    /// Serves the newly registered demand, including a read whose short subscription
+    /// has already ended. With no generation, recovery starts the next connection
+    /// through the same backoff and shutdown checks as demand present at EOF.
+    async fn serve_streams(self: &Arc<Self>) {
+        let input = self.state.lock().await.input.clone();
+        if let Some(input) = input {
             let _ = input.send(bridge::BridgeInput::ServeStreams);
+        } else {
+            self.recover().await;
         }
     }
 
