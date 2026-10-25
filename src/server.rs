@@ -30,7 +30,7 @@ use crate::options::{Options, normalize_origin};
 use crate::protocol::admission::{self, OpWrite};
 use crate::protocol::documents::{ErrorCode, ProtocolError, Scope};
 use crate::protocol::publication::Publication;
-use crate::protocol::subscription::HEARTBEAT;
+use crate::protocol::tree_stream::HEARTBEAT;
 use crate::protocol::wire;
 
 const BRIDGE_SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(5);
@@ -364,7 +364,7 @@ impl BridgeHub {
 
     /// An operation write (protocol §6): the bridge admits it under one
     /// guard. Without an Agent connection the same checks run on the published
-    /// documents, and an admissible write is `unavailable`; nothing starts a
+    /// tree, and an admissible write is `unavailable`; nothing starts a
     /// connection.
     async fn operate(
         &self,
@@ -386,12 +386,14 @@ impl BridgeHub {
             }
         }
         let published = self.publication.lock();
-        admission::admit(
-            &|scope| published.feed.live(scope),
-            &|session, id| published.feed.attachment(session, id),
-            &scope,
-            &write,
-        )?;
+        published.feed.with_state(|tree, projector| {
+            admission::admit(
+                tree,
+                &|session, id| projector.attachment(session, id).cloned(),
+                &scope,
+                &write,
+            )
+        })?;
         Err(ProtocolError::new(
             ErrorCode::Unavailable,
             "there is no Agent connection",
@@ -705,13 +707,10 @@ async fn read_session(
         return invalid_request(format!("{attachment_id} is not an attachment ID"));
     }
     let session = Scope::Session(session_id.to_string());
-    let held = state
-        .bridge
-        .publication
-        .lock()
-        .feed
-        .live(&session)
-        .is_some();
+    let held = {
+        let published = state.bridge.publication.lock();
+        published.feed.with_tree(|tree| admission::target(tree, &session).is_some())
+    };
     let scope = session.to_string();
     let unheld = || {
         refused(ProtocolError::new(
@@ -1567,8 +1566,8 @@ mod tests {
     async fn shutdown_closes_event_streams_without_an_active_agent() {
         let hub = test_hub();
         let follow =
-            crate::protocol::subscription::parse_stream_query("scope=global").unwrap();
-        let subscription = hub.publication.lock().feed.subscribe(&follow);
+            crate::protocol::tree_stream::params::parse_stream_query("follow=/global").unwrap();
+        let subscription = hub.publication.lock().feed.subscribe_tree(&follow);
         hub.shutdown().await;
         tokio::time::timeout(Duration::from_millis(100), async {
             while subscription.next().await.is_some() {}
@@ -1576,7 +1575,7 @@ mod tests {
         .await
         .expect("shutdown must close every SSE source before HTTP draining");
         // A stream opened after the shutdown has nothing to follow.
-        let late = hub.publication.lock().feed.subscribe(&follow);
+        let late = hub.publication.lock().feed.subscribe_tree(&follow);
         assert!(late.next().await.is_none());
     }
 

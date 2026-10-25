@@ -1,5 +1,5 @@
-//! The live half of a session document (docs/protocol.md §4.2–§4.6). Expected
-//! values are written from the protocol's shapes, not computed by the builder.
+//! The state projections shared by the revision 4 tree (docs/protocol-r4-design.md §4).
+//! Expected values are written from the protocol shapes, not computed by the projection.
 
 use serde_json::{Value, json};
 
@@ -26,8 +26,29 @@ fn registry() -> SessionRegistry {
     registry
 }
 
+fn session_live(registry: &SessionRegistry, session_id: &str) -> Option<Value> {
+    project_session_live(registry, session_id).map(|live| serde_json::to_value(live).unwrap())
+}
+
 fn live(registry: &SessionRegistry) -> Value {
     session_live(registry, "s").expect("the session is held")
+}
+
+fn global_live(registry: &SessionRegistry, agent: &AgentInfo) -> Value {
+    serde_json::to_value(project_global(registry, agent)).unwrap()
+}
+
+fn catalog_live(registry: &SessionRegistry, revision: u64) -> Value {
+    let catalog = project_catalog(registry, revision);
+    json!({ "revision": catalog.revision, "pages": catalog.pages })
+}
+
+fn scope_live(registry: &SessionRegistry, scope: &Scope, agent: &AgentInfo, revision: u64) -> Option<Value> {
+    Some(match scope {
+        Scope::Session(session_id) => session_live(registry, session_id)?,
+        Scope::Global => global_live(registry, agent),
+        Scope::Catalog => serde_json::to_value(project_catalog(registry, revision)).unwrap(),
+    })
 }
 
 #[test]
@@ -206,7 +227,8 @@ fn the_catalog_names_the_revision_of_the_agents_list() {
 
 
 fn operation(registry: &SessionRegistry, scope: &Scope) -> Value {
-    operation_doc(registry, scope).expect("the scope shows an operation")
+    let (operation, _) = shown_operation(registry, scope).expect("the scope shows an operation");
+    serde_json::to_value(operation).unwrap()
 }
 
 #[test]
@@ -419,66 +441,13 @@ fn a_url_flow_the_agent_completed_or_the_connection_ended_stays_with_its_status(
         "gone",
     ));
     assert_eq!(status(&registry), [json!("completed"), json!("ended")]);
-    let summary = project::project_global(&registry, &agent());
+    let summary = project_global(&registry, &agent());
     assert_eq!(summary.sessions["s"].pending.url_flows, 0, "only waiting flows are pending");
 }
 
 #[test]
 fn an_unknown_scope_has_no_live_document() {
     assert_eq!(scope_live(&registry(), &Scope::Session("unknown".into()), &agent(), 0), None);
-}
-
-// --- what the publisher is handed (engine input) ----------------------------------------
-
-use crate::protocol::timeline::History;
-
-#[test]
-fn a_sessions_input_carries_its_epoch_history_timeline_and_complete_live() {
-    let mut registry = registry();
-    registry
-        .append_session_update(
-            "s",
-            json!({ "sessionUpdate": "agent_message_chunk", "messageId": "m",
-                    "content": { "type": "text", "text": "hi" } }),
-        )
-        .unwrap();
-    let input = engine_input(&registry, &Scope::Session("s".into()), &agent(), 0, "process")
-        .expect("the session is held");
-    let state = &registry.sessions.get("s").unwrap().state;
-    assert_eq!(Some(input.epoch.clone()), state.timeline_epoch);
-    assert_ne!(input.epoch, "process", "a session's epoch is its timeline's");
-    assert_eq!(input.history, Some(History::Complete));
-    assert_eq!(input.timeline.as_ref().unwrap().entries().len(), 1);
-    assert_eq!(input.live["sessionId"], "s");
-    assert!(input.live.get("op").is_some() && input.live.get("interactions").is_some());
-}
-
-#[test]
-fn a_session_with_an_unknown_history_has_no_timeline() {
-    let mut registry = SessionRegistry::new("epoch");
-    registry
-        .open_new("epoch", "c", "/c", json!({ "sessionId": "c" }))
-        .unwrap();
-    // The session stays held, but what it knew of its history is gone.
-    registry.register_cold("c");
-    let input = engine_input(&registry, &Scope::Session("c".into()), &agent(), 0, "process").unwrap();
-    assert!(input.timeline.is_none());
-    assert_eq!(input.history, None);
-}
-
-#[test]
-fn global_and_catalog_are_published_under_the_process_epoch_without_a_timeline() {
-    let registry = registry();
-    for scope in [Scope::Global, Scope::Catalog] {
-        let input = engine_input(&registry, &scope, &agent(), 3, "process-epoch").unwrap();
-        assert_eq!(input.epoch, "process-epoch");
-        assert!(input.timeline.is_none() && input.history.is_none());
-    }
-}
-
-#[test]
-fn an_unheld_session_has_no_input() {
-    assert!(engine_input(&registry(), &Scope::Session("nope".into()), &agent(), 0, "p").is_none());
 }
 
 // -- The origin of a session (protocol §4.3, §6.2) ---------------------------------------

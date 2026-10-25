@@ -297,3 +297,6 @@ pub(crate) fn project_catalog(registry: &SessionRegistry, revision: u64) -> Cata
         },
     }
 }
+
+#[cfg(test)]
+mod tests;

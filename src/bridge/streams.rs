@@ -10,18 +10,21 @@ use std::collections::BTreeMap;
 
 use super::*;
 use crate::protocol::documents::{End, EndReason, ErrorCode, ProtocolError, Scope};
-use crate::protocol::feed::FeedSubscription;
+#[cfg(test)]
+use crate::protocol::feed::TreeSubscription;
 use crate::protocol::publication::Publication;
-use crate::protocol::subscription::Subscribed;
+#[cfg(test)]
+use crate::protocol::tree_stream::params::StreamQuery;
 
 /// Registers a subscription under the bridge guard, from the cut the guard
 /// sees, and starts what it waits for. The guard's commit, on its release,
 /// publishes the start after the cut.
+#[cfg(test)]
 pub(super) fn subscribe(
     state: &mut BridgeState,
-    scopes: &[Subscribed],
-) -> (FeedSubscription, Option<Value>) {
-    let subscription = register(state, scopes);
+    query: &StreamQuery,
+) -> (TreeSubscription, Option<Value>) {
+    let subscription = register(state, query);
     let command = serve(state);
     refresh_observer_timers(state);
     (subscription, command)
@@ -30,8 +33,9 @@ pub(super) fn subscribe(
 /// Registers a subscription under the bridge guard, from the cut the guard
 /// sees, without starting a load: while the Agent initializes, its
 /// capabilities are not known yet. Its readiness serves the streams.
-pub(super) fn register(state: &BridgeState, scopes: &[Subscribed]) -> FeedSubscription {
-    state.protocol.publication.lock().feed.subscribe(scopes)
+#[cfg(test)]
+pub(super) fn register(state: &BridgeState, query: &StreamQuery) -> TreeSubscription {
+    state.protocol.publication.lock().feed.subscribe_tree(query)
 }
 
 /// Asks the actor to serve the streams again.
@@ -123,8 +127,7 @@ fn published(publication: &Publication, session_id: &str) -> bool {
     publication
         .lock()
         .feed
-        .live(&Scope::Session(session_id.to_string()))
-        .is_some()
+        .with_tree(|tree| tree.get("/sessions").and_then(|sessions| sessions.child(session_id)).is_some())
 }
 
 /// Ends `session/<session_id>` on every subscription still waiting for it.

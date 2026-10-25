@@ -45,6 +45,9 @@ pub(crate) struct ReplayValidationBackup {
 pub(crate) struct MaterializationResources {
     pub(crate) attempt_id: String,
     pub(crate) cancellation: CancellationToken,
+    /// The current attachment attempt already recorded its load failure in the registry.
+    /// Its result owner must release the resource without reporting that failure a second time.
+    pub(crate) failure_recorded: bool,
 }
 
 /// One optional history workflow owns this slot for its whole lifetime:

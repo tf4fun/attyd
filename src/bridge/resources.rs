@@ -93,10 +93,13 @@ fn answer(
 ) -> Result<(), ProtocolError> {
     let interaction = {
         let published = state.protocol.publication.lock();
-        published
-            .feed
-            .live(scope)
-            .and_then(|live| live["interactions"].get(interaction_id).cloned())
+        published.feed.with_tree(|tree| {
+            crate::protocol::admission::target(tree, scope)
+                .and_then(|target| target.child("interactions"))
+                .and_then(|interactions| interactions.child(interaction_id))
+                .and_then(|interaction| interaction.as_value())
+                .map(|(interaction, _)| interaction.clone())
+        })
     }
     .filter(|_| {
         state.sessions.permission(interaction_id).is_some()

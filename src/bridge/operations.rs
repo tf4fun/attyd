@@ -39,12 +39,14 @@ pub(super) fn admit(
 ) -> Result<Write, ProtocolError> {
     let admitted = {
         let published = state.protocol.publication.lock();
-        admission::admit(
-            &|scope| published.feed.live(scope),
-            &|session, id| published.feed.attachment(session, id),
-            scope,
-            write,
-        )?
+        published.feed.with_state(|tree, projector| {
+            admission::admit(
+                tree,
+                &|session, id| projector.attachment(session, id).cloned(),
+                scope,
+                write,
+            )
+        })?
     };
     if let Admitted::Repeat { op } = admitted {
         return Ok(Write::Repeat(OperationAdmission { op, end: None }));
@@ -197,22 +199,26 @@ pub(super) fn deliver(
 /// `scope` shows (protocol §6.2).
 pub(super) fn cancel_outcomes(state: &BridgeState, scope: &OpScope) -> Vec<(String, Answer)> {
     let published = state.protocol.publication.lock();
-    let Some(live) = published.feed.live(scope) else {
-        return Vec::new();
-    };
-    live["interactions"]
-        .as_object()
-        .into_iter()
-        .flatten()
-        .map(|(id, interaction)| {
-            let answer = if interaction["kind"] == "permission" {
-                Answer::Permission(RequestPermissionOutcome::Cancelled)
-            } else {
-                Answer::Elicitation(CreateElicitationResponse::new(ElicitationAction::Cancel))
-            };
-            (id.clone(), answer)
-        })
-        .collect()
+    published.feed.with_tree(|tree| {
+        let Some(interactions) = admission::target(tree, scope)
+            .and_then(|target| target.child("interactions"))
+        else {
+            return Vec::new();
+        };
+        interactions
+            .child_names()
+            .into_iter()
+            .filter_map(|id| {
+                let (interaction, _) = interactions.child(id)?.as_value()?;
+                let answer = if interaction["kind"] == "permission" {
+                    Answer::Permission(RequestPermissionOutcome::Cancelled)
+                } else {
+                    Answer::Elicitation(CreateElicitationResponse::new(ElicitationAction::Cancel))
+                };
+                Some((id.to_string(), answer))
+            })
+            .collect()
+    })
 }
 
 /// Applies an admitted `cancel` of the running operation `op` under the guard that admitted

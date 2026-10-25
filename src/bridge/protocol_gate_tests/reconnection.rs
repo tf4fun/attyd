@@ -100,7 +100,7 @@ async fn review_an_unfollowed_session_is_released_when_the_agent_connection_ends
         !peer.published(&scope),
         "an unneeded session must leave the feed at EOF, without waiting for another connection"
     );
-    let global = peer.publication.lock().feed.live(&Scope::Global).unwrap();
+    let global = peer.publication.lock().feed.with_tree(|tree| tree.get("/global").unwrap().to_value());
     assert!(
         global["sessions"].get(CREATED).is_none(),
         "the final global document must no longer list the released session"

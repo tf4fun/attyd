@@ -1,4 +1,4 @@
-//! The feed commits the revision 4 tree beside the scopes (docs/protocol-r4-design.md §4.1):
+//! The feed commits the revision 4 tree (docs/protocol-r4-design.md §4.1):
 //! one revision per commit that changed anything, under an instance of the process.
 use serde_json::json;
 
@@ -26,7 +26,7 @@ fn registry() -> SessionRegistry {
 
 #[test]
 fn the_first_commit_is_revision_one_and_a_commit_without_a_change_is_no_revision() {
-    let mut feed = Feed::new("process");
+    let mut feed = Feed::new();
     let registry = registry();
     assert_eq!(feed.tree().rev(), 0);
     feed.commit(&registry, &agent(), 1);
@@ -37,7 +37,7 @@ fn the_first_commit_is_revision_one_and_a_commit_without_a_change_is_no_revision
 
 #[test]
 fn one_commit_installing_a_session_is_one_revision_for_all_its_paths() {
-    let mut feed = Feed::new("process");
+    let mut feed = Feed::new();
     let mut registry = SessionRegistry::new("epoch");
     feed.commit(&registry, &agent(), 1);
     registry
@@ -52,17 +52,16 @@ fn one_commit_installing_a_session_is_one_revision_for_all_its_paths() {
 }
 
 #[test]
-fn the_instance_belongs_to_the_process_and_differs_from_the_scope_epoch() {
-    let a = Feed::new("process");
-    let b = Feed::new("process");
+fn each_feed_has_a_fresh_instance() {
+    let a = Feed::new();
+    let b = Feed::new();
     assert_ne!(a.tree().instance(), b.tree().instance());
-    assert_ne!(a.tree().instance(), "process");
     assert_eq!(a.tree().instance().len(), 22, "128 bits in unpadded base64url");
 }
 
 #[test]
 fn a_released_session_leaves_the_tree() {
-    let mut feed = Feed::new("process");
+    let mut feed = Feed::new();
     let mut registry = registry();
     feed.commit(&registry, &agent(), 1);
     registry

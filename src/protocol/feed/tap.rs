@@ -1,153 +1,114 @@
-//! What a test sees of the feed: every commit's events and the documents it left, and whether
-//! a commit now would publish anything (docs/state-sync.md §4.1).
+//! Test observation of the real revision 4 publisher: atomic wire events and their committed
+//! node values. The tap's subscriber never participates in session holding or view demand.
 use std::collections::BTreeMap;
 
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::*;
+use crate::protocol::tree::Spec;
+use crate::protocol::tree_stream::params::Follow;
 
-/// One commit as the tap receives it: the events it published, in order, and every document
-/// published after it, each as the snapshot a subscriber would be aligned with.
+/// One tree commit and the native node values it leaves. The gate applies these events through
+/// the R4 client; scope-shaped assertion documents are reconstructed only after replication.
 pub(crate) struct TapCommit {
-    pub events: Vec<Value>,
+    pub events: Vec<TreeEvent>,
     pub documents: BTreeMap<String, Value>,
 }
 
 #[derive(Default)]
 pub(super) struct Tap {
     sender: Option<UnboundedSender<TapCommit>>,
-    pending: Vec<Value>,
-    /// A session left the published documents in this commit.
-    released: bool,
+    subscriber: Option<TreeSubscriber>,
 }
 
 impl Feed {
-    /// How many subscriptions still follow `scope`.
+    /// How many real subscriptions still follow this target (or a path inside its session).
     pub(crate) fn followers(&self, scope: &str) -> usize {
-        let scopes = self
-            .subscribers
-            .values()
-            .filter(|subscriber| subscriber.followed().any(|(followed, _)| followed == scope))
-            .count();
-        // A stream of the tree follows a session through any path of it.
         let session_id = scope.strip_prefix("session/");
-        let paths = self
-            .tree_subscribers
-            .values()
-            .filter(|subscriber| {
-                subscriber
-                    .followed()
-                    .any(|path| session_id.is_some() && session_of(path).as_deref() == session_id)
+        self.tree_subscribers.values().filter(|subscriber| {
+            subscriber.followed().any(|path| {
+                if let Some(id) = session_id {
+                    session_of(path).as_deref() == Some(id)
+                } else {
+                    path.strip_prefix('/').is_some_and(|path| {
+                        path == scope || path.strip_prefix(scope).is_some_and(|tail| tail.starts_with('/'))
+                    })
+                }
             })
-            .count();
-        scopes + paths
+        }).count()
     }
 
-    /// Taps every later commit and returns the published documents now: a cut.
-    pub(crate) fn tap(&mut self, sender: UnboundedSender<TapCommit>) -> BTreeMap<String, Value> {
-        self.tap.sender = Some(sender);
-        self.documents()
+    /// Register observation and return its first real stream event as an atomic cut.
+    pub(crate) fn tap(&mut self, sender: UnboundedSender<TapCommit>) -> TapCommit {
+        let query = StreamQuery {
+            follow: ["/global", "/catalog", "/sessions"].into_iter().map(|path| Follow {
+                path: path.into(), have: None, window: None,
+            }).collect(),
+            ..Default::default()
+        };
+        let mut subscriber = TreeSubscriber::new(&query, &self.tree);
+        let events = std::iter::from_fn(|| subscriber.next()).collect();
+        self.tap = Tap { sender: Some(sender), subscriber: Some(subscriber) };
+        TapCommit { events, documents: self.documents() }
     }
 
-    /// Every published document, as a snapshot from nothing.
+    /// Every native target node now, without any R3 snapshot or replica adapter.
     pub(crate) fn documents(&self) -> BTreeMap<String, Value> {
-        self.engine
-            .scopes()
-            .filter_map(|scope| {
-                let snapshot = self.engine.snapshot(scope, None)?;
-                Some((scope.to_string(), serde_json::to_value(snapshot).ok()?))
-            })
-            .collect()
-    }
-
-    pub(super) fn tap_event(&mut self, event: &StreamEvent) {
-        if self.tap.sender.is_some() {
-            self.tap
-                .pending
-                .push(serde_json::to_value(event).expect("an event serializes"));
+        let mut documents = BTreeMap::new();
+        for scope in ["global", "catalog"] {
+            if let Some(node) = self.tree.get(&format!("/{scope}")) {
+                documents.insert(scope.to_string(), node.to_value());
+            }
         }
-    }
-
-    pub(super) fn tap_rebuilt(&mut self, scope: &str) {
-        if let Some(snapshot) = self.engine.snapshot(scope, None) {
-            self.tap_event(&snapshot);
+        if let Some(sessions) = self.tree.get("/sessions") {
+            for id in sessions.child_names() {
+                documents.insert(format!("session/{id}"), sessions.child(id).unwrap().to_value());
+            }
         }
+        documents
     }
 
-    pub(super) fn tap_released(&mut self) {
-        self.tap.released = true;
-    }
-
-    /// Hands the commit's events and documents to the tap, if it published any or released a
-    /// session (which sends no event).
-    pub(super) fn tap_flush(&mut self) {
-        if self.tap.pending.is_empty() && !self.tap.released {
+    pub(super) fn tap_publish(&mut self, committed: &Committed, now: Instant, ends: &BTreeMap<String, TreeEnd>) {
+        if self.tap.sender.as_ref().is_none_or(UnboundedSender::is_closed) {
             return;
         }
-        self.tap.released = false;
-        let events = std::mem::take(&mut self.tap.pending);
-        let documents = self.documents();
-        if let Some(sender) = &self.tap.sender {
-            let _ = sender.send(TapCommit { events, documents });
+        let subscriber = self.tap.subscriber.as_mut().expect("a tap has a subscriber");
+        subscriber.publish_ended(&self.tree, committed, now, ends);
+        let events: Vec<_> = std::iter::from_fn(|| subscriber.next()).collect();
+        if !events.is_empty() {
+            let commit = TapCommit { events, documents: self.documents() };
+            let _ = self.tap.sender.as_ref().unwrap().send(commit);
         }
     }
 
-    /// Whether a commit now would publish anything: a transition that changed what clients see
-    /// without committing it.
-    pub(crate) fn diverges(
-        &self,
-        registry: &SessionRegistry,
-        agent: &AgentInfo,
-        catalog_revision: u64,
-    ) -> bool {
-        let mut scopes = vec![Scope::Global, Scope::Catalog];
-        scopes.extend(held_sessions(registry).into_iter().map(Scope::Session));
-        let held: Vec<String> = scopes.iter().map(Scope::to_string).collect();
-        if self
-            .engine
-            .scopes()
-            .any(|published| published.starts_with("session/") && !held.contains(&published.to_string()))
-        {
-            return true;
+    /// Detects state changes omitted from a commit, without changing publication or its cache.
+    pub(crate) fn diverges(&self, registry: &SessionRegistry, agent: &AgentInfo, catalog_revision: u64) -> bool {
+        let mut projector = self.projector.clone();
+        let mut root = projector.project(registry, agent, catalog_revision, self.tree.rev() + 1);
+        // Views are derived from these canonical nodes. Retain their current demand so an
+        // expired read pin cannot masquerade as an uncommitted registry transition.
+        if self.tree.get("/views").is_some() {
+            root.insert("views".into(), Spec::Keep);
         }
-        scopes.iter().any(|scope| {
-            engine_input(registry, scope, agent, catalog_revision, &self.process_epoch)
-                .is_some_and(|input| self.engine.diverges(&scope.to_string(), &input))
-        })
-    }
-}
-
-impl FeedSubscription {
-    /// The next event if one is queued now.
-    pub(crate) fn try_next(&self) -> Option<StreamEvent> {
-        self.0.handle.feed().next(self.0.id)
+        self.tree.clone().commit(root).is_some()
     }
 }
 
 impl FeedHandle {
-    /// How many subscriptions still follow `scope`.
     pub(crate) fn followers(&self, scope: &str) -> usize {
         self.feed().followers(scope)
     }
 
-    /// Taps every later commit and returns the published documents now.
-    pub(crate) fn tap(&self, sender: UnboundedSender<TapCommit>) -> BTreeMap<String, Value> {
+    pub(crate) fn tap(&self, sender: UnboundedSender<TapCommit>) -> TapCommit {
         self.feed().tap(sender)
     }
 
-    /// Every published document now.
     pub(crate) fn documents(&self) -> BTreeMap<String, Value> {
         self.feed().documents()
     }
 
-    /// Whether a commit now would publish anything.
-    pub(crate) fn diverges(
-        &self,
-        registry: &SessionRegistry,
-        agent: &AgentInfo,
-        catalog_revision: u64,
-    ) -> bool {
+    pub(crate) fn diverges(&self, registry: &SessionRegistry, agent: &AgentInfo, catalog_revision: u64) -> bool {
         self.feed().diverges(registry, agent, catalog_revision)
     }
 }

@@ -1,7 +1,7 @@
-//! When a scope is due a checkpoint (docs/protocol.md §5.5).
+//! When a followed path is due a checkpoint (docs/protocol.md §6).
 //!
-//! A checkpoint states the digest of a scope's document at its current rev.
-//! While a scope keeps changing, a checkpoint every change would cost more than
+//! A checkpoint states the hash of a path at its current version.
+//! While a path keeps changing, a checkpoint every change would cost more than
 //! it protects: one is due after a pause in the changes, and at the latest a
 //! fixed time after the first change no checkpoint has covered. The pacer
 //! knows only instants it is given.

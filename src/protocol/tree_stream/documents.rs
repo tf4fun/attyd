@@ -6,6 +6,30 @@ use serde_json::{Map, Value, json};
 
 use super::super::tree::escape;
 
+/// A read-only assertion view of a scope assembled from the R4 client's held node. It does
+/// not apply events or maintain a second replication protocol.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Document {
+    pub doc: Value,
+    pub rev: u64,
+}
+
+impl Document {
+    pub(crate) fn live(&self) -> Value {
+        self.doc["live"].clone()
+    }
+
+    pub(crate) fn entries(&self) -> Vec<Value> {
+        self.doc["entries"].as_array().cloned().unwrap_or_default()
+    }
+
+    pub(crate) fn ended_prompts(&self) -> usize {
+        self.doc["prompts"].as_array().map_or(0, |prompts| {
+            prompts.iter().filter(|prompt| prompt.get("end").is_some()).count()
+        })
+    }
+}
+
 /// The tree path of a scope.
 pub(crate) fn path_of(scope: &str) -> String {
     match scope.strip_prefix("session/") {

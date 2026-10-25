@@ -10,7 +10,7 @@
 use tokio::task::JoinHandle;
 
 use super::*;
-use crate::protocol::replica::Replica;
+use crate::protocol::tree_stream::documents::Document;
 
 mod admission;
 mod execution;
@@ -86,11 +86,24 @@ async fn body_of(response: Response<hyper::body::Incoming>) -> (StatusCode, Valu
 
 /// The document of `scope` at `address`, read from its node.
 async fn read_scope(address: SocketAddr, scope: &str) -> (StatusCode, Value) {
-    let (status, body) = read_scope_snapshot(address, scope).await;
-    if status == StatusCode::OK {
-        (status, Replica::from_snapshot(&body).doc)
-    } else {
-        (status, body)
+    use crate::protocol::tree_stream::{client::Client, documents::{document, path_of}, wire::Event};
+    let path = path_of(scope);
+    let url = format!("/api/v2/nodes{}", path.split('/').map(encoded).collect::<Vec<_>>().join("/"));
+    let response = send(address, Method::GET, &url, None).await;
+    let status = response.status();
+    let body = json_of(response).await;
+    if status != StatusCode::OK { return (status, body); }
+    let event: Event = serde_json::from_value(json!({
+        "instance": body["instance"], "rev": body["rev"], "changes": [body["change"]],
+    })).unwrap();
+    let mut client = Client::following(&[&path]);
+    client.apply(&event).unwrap();
+    match client.value(&path).and_then(|value| document(scope, value)) {
+        Some(doc) => (status, doc),
+        None => (
+            StatusCode::NOT_FOUND,
+            json!({ "error": { "code": "not_found", "message": format!("{scope} is not there") } }),
+        ),
     }
 }
 
@@ -428,7 +441,7 @@ fn not_found(status: StatusCode, body: &Value, what: &str) {
 struct Watch {
     sse: Sse,
     client: crate::protocol::tree_stream::client::Client,
-    replicas: BTreeMap<String, Replica>,
+    replicas: BTreeMap<String, Document>,
     /// How each scope that ended, with a reason, ended.
     ended: BTreeMap<String, Value>,
     /// Every event taken, in order.
@@ -458,7 +471,6 @@ impl Watch {
         self.client
             .apply(&wire)
             .unwrap_or_else(|error| panic!("invalid HTTP SSE event: {error}: {event}"));
-        let instance = self.client.instance.clone().unwrap_or_default();
         for change in event["changes"].as_array().into_iter().flatten() {
             let Some(scope) = change["path"].as_str().and_then(scope_of) else { continue };
             let path = change["path"].as_str().unwrap();
@@ -467,7 +479,7 @@ impl Watch {
                     self.ended.remove(&scope);
                     self.replicas.insert(
                         scope,
-                        Replica { epoch: instance.clone(), rev: self.client.version(path), doc },
+                        Document { rev: self.client.version(path), doc },
                     );
                 }
                 None => {
@@ -511,11 +523,11 @@ impl Watch {
     }
 
     fn live(&self, scope: &str) -> Value {
-        self.replicas.get(scope).map_or(Value::Null, Replica::live)
+        self.replicas.get(scope).map_or(Value::Null, Document::live)
     }
 
     fn entries(&self, scope: &str) -> Vec<Value> {
-        self.replicas.get(scope).map_or_else(Vec::new, Replica::entries)
+        self.replicas.get(scope).map_or_else(Vec::new, Document::entries)
     }
 
     fn ended(&self, scope: &str) -> Option<Value> {

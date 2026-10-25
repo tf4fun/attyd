@@ -8,7 +8,7 @@
 //! So far: the control reduction (`controls`), the JSON Pointer ops (`diff`),
 //! `canon` (content blocks, attachment references, JCS) (`canon`), the documents and
 //! events (`documents`), operation slots (`op`, `registry`), the projections
-//! (`project`) and the feed (`feed`, `engine`, `subscription`) the bridge actor
+//! (`project`) and the tree feed (`feed`, `tree_doc`, `tree_stream`) the bridge actor
 //! commits to (docs/state-sync.md §5).
 
 pub(crate) mod admission;
@@ -17,19 +17,14 @@ pub(crate) mod controls;
 pub(crate) mod diff;
 pub(crate) mod digest;
 pub(crate) mod documents;
-pub(crate) mod engine;
 pub(crate) mod feed;
 pub(crate) mod hash;
-pub(crate) mod live_doc;
 pub(crate) mod op;
 pub(crate) mod outcome;
 pub(crate) mod pacing;
 pub(crate) mod project;
 pub(crate) mod publication;
 pub(crate) mod registry;
-#[cfg(test)]
-pub(crate) mod replica;
-pub(crate) mod subscription;
 pub(crate) mod timeline;
 pub(crate) mod timeline_doc;
 pub(crate) mod tree;

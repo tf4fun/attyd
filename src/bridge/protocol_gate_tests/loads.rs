@@ -46,6 +46,7 @@ async fn two_subscriptions_share_one_load_and_both_end_with_the_replayed_entries
     let load = peer.request("session/load").await;
     // A client that holds the session from an earlier run of the bridge.
     let mut remembering = Stream::open(&peer, &[scope.as_str()], Some(CWD));
+    remembering.client = earlier.client.clone();
     remembering.replicas = earlier.replicas.clone();
     remembering.reopen(&peer, Some(CWD));
     for stream in [&mut fresh, &mut remembering] {
@@ -161,9 +162,10 @@ async fn an_unheld_session_without_cwd_or_whose_load_fails_ends_with_load_failed
     assert_eq!(end["error"]["code"], "invalid_request");
     assert_eq!(
         missing.events_of(&scope).len(),
-        1,
-        "the end is the scope's only event"
+        2,
+        "R4 first reports absent, then the load failure"
     );
+    assert_eq!(missing.events_of(&scope)[0]["end"]["reason"], "absent");
     peer.quiet(Duration::from_millis(200)).await;
     let before = missing.events_of("global").len();
     let op = peer.install("global", OperationKind::Logout, json!({})).await;
@@ -192,6 +194,10 @@ async fn an_unheld_session_without_cwd_or_whose_load_fails_ends_with_load_failed
     assert_eq!(end["reason"], "load_failed");
     assert_eq!(end["error"]["code"], "agent_error");
     peer.settled().await;
+    let failure = peer.publication.lock().feed.with_tree(|tree| {
+        tree.get("/global/loadFailures/saved").expect("the failed load is recorded").to_value()
+    });
+    assert_eq!(failure["code"], "agent_error", "materialization cleanup keeps the Agent's original failure");
 }
 
 fn deletable() -> Value {
@@ -211,14 +217,16 @@ async fn review_a_subscription_after_delete_admission_waits_for_its_end() {
     let delete = peer.request("session/delete").await;
     peer.quiet(Duration::from_millis(200)).await;
     stream.take_all(&mut peer);
-    assert!(stream.events.is_empty(), "the occupied scope waits");
+    assert_eq!(stream.events_of(&scope).len(), 1, "the occupied scope only reports absence");
+    assert_eq!(stream.events_of(&scope)[0]["end"]["reason"], "absent");
+    assert!(!stream.replicas.contains_key(&scope) && stream.ended.is_empty(), "the occupied scope waits");
     peer.reply(&delete, json!({})).await;
     stream
         .until(&mut peer, "the admitted delete ends", |stream| {
             stream.ended.contains_key(&scope)
         })
         .await;
-    assert_eq!(stream.events.len(), 1, "End is the first event");
+    assert_eq!(stream.events_of(&scope).len(), 2, "deleted follows the initial absence");
     assert_eq!(stream.ended[&scope]["reason"], "deleted");
     peer.quiet(Duration::from_millis(200)).await;
 }
@@ -233,12 +241,14 @@ async fn a_subscription_waits_for_a_cold_delete_and_ends_with_deleted() {
     let mut stream = Stream::open(&peer, &[scope.as_str()], Some(CWD));
     peer.quiet(Duration::from_millis(200)).await;
     stream.take_all(&mut peer);
-    assert!(stream.events.is_empty(), "the stream waits");
+    assert_eq!(stream.events_of(&scope).len(), 1, "the stream only reports absence");
+    assert_eq!(stream.events_of(&scope)[0]["end"]["reason"], "absent");
+    assert!(!stream.replicas.contains_key(&scope) && stream.ended.is_empty(), "the stream waits");
     peer.reply(&delete, json!({})).await;
     stream
         .until(&mut peer, "the end", |stream| stream.ended.contains_key(&scope))
         .await;
-    assert_eq!(stream.events.len(), 1, "the end is the first message");
+    assert_eq!(stream.events_of(&scope).len(), 2, "deleted follows the initial absence");
     assert_eq!(stream.ended[&scope]["reason"], "deleted");
     peer.quiet(Duration::from_millis(200)).await;
 }

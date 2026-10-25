@@ -2,12 +2,10 @@
 //! committed change and queues the events of every subscriber that follows what
 //! changed.
 //!
-//! Each commit publishes every scope the bridge holds through the publisher
-//! (`engine`): a scope that did not change publishes nothing, a scope that is new
-//! or has a new epoch is a snapshot for its subscribers, and any other change is
-//! the next rev as ops. A session the bridge no longer holds ends its scope. A
-//! subscriber whose queue went past its budget is sent snapshots instead.
-use std::collections::{BTreeMap, HashSet};
+//! Each commit projects the held state into one revision 4 tree. Streams follow selected
+//! paths and receive the changes to those paths; a slow stream is aligned again from the
+//! versions it actually received. Admission and attachment reads use this same committed state.
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -15,12 +13,7 @@ use serde_json::Value;
 use tokio::sync::{Notify, watch};
 use tokio::time::Instant;
 
-use super::documents::{AgentInfo, End, EndReason, Scope};
-use super::engine::{Commit, Engine, StreamEvent};
-use super::live_doc::engine_input;
-use super::pacing::Pacer;
-use super::project::held_sessions;
-use super::subscription::{Encoded, Subscribed, Subscriber};
+use super::documents::{AgentInfo, End, EndReason};
 use super::tree::{Committed, Tree};
 use super::tree_doc::{ErrorSummary, Projector};
 use super::tree_stream::params::{StreamQuery, session_of};
@@ -40,14 +33,8 @@ pub(crate) struct Waiting {
 }
 
 pub(crate) struct Feed {
-    engine: Engine,
-    /// The epoch `global` and `catalog` are published under.
-    process_epoch: String,
-    subscribers: BTreeMap<SubscriptionId, Subscriber>,
     next_id: SubscriptionId,
-    /// When a scope that changed is due its checkpoint.
-    pacer: Pacer,
-    /// The revision 4 state tree (docs/protocol-r4-design.md §4), committed beside the scopes.
+    /// The committed state shared by admission, reads and subscribers.
     tree: Tree,
     projector: Projector,
     /// The streams of revision 4, which follow paths of the tree.
@@ -71,14 +58,10 @@ pub(crate) struct Feed {
 pub(crate) const VIEW_LINGER: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl Feed {
-    pub(crate) fn new(process_epoch: impl Into<String>) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
-            engine: Engine::default(),
-            process_epoch: process_epoch.into(),
-            subscribers: BTreeMap::new(),
             next_id: 1,
-            pacer: Pacer::default(),
-            // A random instance per process, apart from the scopes' epoch (§4.1).
+            // A random instance per bridge process (§4.1).
             tree: Tree::new(super::op::operation_id()),
             projector: Projector::default(),
             tree_subscribers: BTreeMap::new(),
@@ -94,17 +77,6 @@ impl Feed {
     /// The revision 4 tree as last committed.
     pub(crate) fn tree(&self) -> &Tree {
         &self.tree
-    }
-
-    /// Registers a subscriber and queues the alignment of every scope that is
-    /// published; one that is not is aligned when it is.
-    pub(crate) fn subscribe(&mut self, follow: &[Subscribed]) -> SubscriptionId {
-        let id = self.next_id;
-        self.next_id += 1;
-        let mut subscriber = Subscriber::new(follow);
-        subscriber.align(&self.engine);
-        self.subscribers.insert(id, subscriber);
-        id
     }
 
     /// The views something follows or has read lately, and those `extra` follows.
@@ -148,9 +120,13 @@ impl Feed {
     /// `subscribe_tree`; a read (`linger`) keeps the views it asks for.
     pub(crate) fn subscribe_tree_at(&mut self, query: &StreamQuery, linger: bool) -> SubscriptionId {
         self.materialize_views(query, linger, Instant::now());
+        self.add_subscriber(TreeSubscriber::new(query, &self.tree))
+    }
+
+    fn add_subscriber(&mut self, subscriber: TreeSubscriber) -> SubscriptionId {
         let id = self.next_id;
         self.next_id += 1;
-        self.tree_subscribers.insert(id, TreeSubscriber::new(query, &self.tree));
+        self.tree_subscribers.insert(id, subscriber);
         id
     }
 
@@ -159,42 +135,17 @@ impl Feed {
     }
 
     pub(crate) fn unsubscribe(&mut self, id: SubscriptionId) {
-        self.subscribers.remove(&id);
         self.tree_subscribers.remove(&id);
     }
 
-    /// The next event to write to subscription `id`.
-    #[cfg(test)]
-    pub(crate) fn next(&mut self, id: SubscriptionId) -> Option<StreamEvent> {
-        self.subscribers.get_mut(&id)?.next()
-    }
-
-    pub(crate) fn next_encoded(&mut self, id: SubscriptionId) -> Option<Encoded> {
-        self.subscribers.get_mut(&id)?.next_encoded()
-    }
-
     pub(crate) fn subscribers(&self) -> usize {
-        self.subscribers.len() + self.tree_subscribers.len()
+        self.tree_subscribers.len()
     }
 
     /// The sessions some subscription follows, with the subscriptions that
     /// follow each and wait for it to be published (protocol §5.1).
     pub(crate) fn followed_sessions(&self) -> BTreeMap<String, Vec<Waiting>> {
         let mut sessions: BTreeMap<String, Vec<Waiting>> = BTreeMap::new();
-        for (&id, subscriber) in &self.subscribers {
-            for (scope, cwd) in subscriber.followed() {
-                let Some(Scope::Session(session_id)) = Scope::parse(scope) else {
-                    continue;
-                };
-                let waiting = sessions.entry(session_id).or_default();
-                if self.engine.version(scope).is_none() {
-                    waiting.push(Waiting {
-                        id,
-                        cwd: cwd.map(String::from),
-                    });
-                }
-            }
-        }
         for (&id, subscriber) in &self.tree_subscribers {
             for path in subscriber.followed() {
                 let Some(session_id) = session_of(path) else {
@@ -244,6 +195,8 @@ impl Feed {
                 subscriber.coalesce(&self.tree);
             }
         }
+        #[cfg(test)]
+        self.tap_publish(committed, now, ends);
     }
 
     /// Ends `session/<session_id>` for the subscriptions still waiting for it:
@@ -266,38 +219,14 @@ impl Feed {
         for subscriber in self.tree_subscribers.values_mut() {
             subscriber.end_session(&self.tree, session_id, &tree_end);
         }
-        let scope = Scope::Session(session_id.to_string()).to_string();
-        if self.engine.version(&scope).is_some() {
-            return;
-        }
-        for subscriber in self.subscribers.values_mut() {
-            subscriber.end(&scope, end.clone());
-        }
-    }
-
-    /// The committed `live` of `scope`: what a write is admitted against.
-    pub(crate) fn live(&self, scope: &Scope) -> Option<Value> {
-        self.engine.live(&scope.to_string()).cloned()
     }
 
     /// The block an attachment of a held session names, while a published entry references it.
     pub(crate) fn attachment(&self, session_id: &str, id: &str) -> Option<Value> {
-        self.engine.attachment(&format!("session/{session_id}"), id).cloned()
+        self.projector.attachment(session_id, id).cloned()
     }
 
-    /// The whole document of `scope`, as a snapshot from nothing.
-    pub(crate) fn snapshot(&self, scope: &str) -> Option<StreamEvent> {
-        self.engine.snapshot(scope, None)
-    }
-
-    /// The version `scope` is published at.
-    pub(crate) fn version(&self, scope: &str) -> Option<(String, u64)> {
-        self.engine
-            .version(scope)
-            .map(|(epoch, rev)| (epoch.to_string(), rev))
-    }
-
-    /// The commit step: publishes every scope that changed since the last one.
+    /// The commit step: publishes the paths that changed since the last one.
     pub(crate) fn commit(
         &mut self,
         registry: &SessionRegistry,
@@ -329,90 +258,8 @@ impl Feed {
         now: Instant,
         ended: &[(String, End)],
     ) {
-        let mut scopes = vec![Scope::Global, Scope::Catalog];
-        scopes.extend(held_sessions(registry).into_iter().map(Scope::Session));
-        for scope in &scopes {
-            let Some(input) = engine_input(
-                registry,
-                scope,
-                agent,
-                catalog_revision,
-                &self.process_epoch,
-            ) else {
-                continue;
-            };
-            let name = scope.to_string();
-            match self.engine.commit(&name, &input) {
-                Commit::Unchanged => {}
-                Commit::Ops(event) => {
-                    #[cfg(test)]
-                    self.tap_event(&event);
-                    self.pacer.changed(&name, now);
-                    let event = Encoded::new(event);
-                    for subscriber in self.subscribers.values_mut() {
-                        subscriber.publish(&event);
-                    }
-                }
-                Commit::Rebuilt => {
-                    #[cfg(test)]
-                    self.tap_rebuilt(&name);
-                    // A snapshot carries a digest of its own.
-                    self.pacer.settled(&name);
-                    for subscriber in self.subscribers.values_mut() {
-                        subscriber.rebuilt(&name, &self.engine);
-                    }
-                }
-            }
-        }
         for (session_id, end) in ended {
             self.end_waiting(session_id, end);
-        }
-        // A session the bridge no longer holds is over.
-        let held: HashSet<String> = scopes.iter().map(Scope::to_string).collect();
-        let gone: Vec<String> = self
-            .engine
-            .scopes()
-            .filter(|published| published.starts_with("session/") && !held.contains(*published))
-            .map(String::from)
-            .collect();
-        for scope in gone {
-            let cwd = self
-                .engine
-                .live(&scope)
-                .and_then(|live| live["cwd"].as_str().map(String::from));
-            self.engine.remove(&scope);
-            self.pacer.settled(&scope);
-            let recorded = ended
-                .iter()
-                .find(|(session_id, _)| Scope::Session(session_id.clone()).to_string() == scope)
-                .map(|(_, end)| end.clone());
-            #[cfg(test)]
-            self.tap_released();
-            // A session that went with a reason ends its scope. One released with none ends
-            // nothing: a client keeps its copy, a follower it still has waits for the
-            // session to be loaded again (S6).
-            match recorded {
-                Some(end) => {
-                    #[cfg(test)]
-                    self.tap_event(&StreamEvent::End {
-                        scope: scope.clone(),
-                        end: end.clone(),
-                    });
-                    for subscriber in self.subscribers.values_mut() {
-                        subscriber.end(&scope, end.clone());
-                    }
-                }
-                None => {
-                    for subscriber in self.subscribers.values_mut() {
-                        subscriber.released(&scope, cwd.as_deref());
-                    }
-                }
-            }
-        }
-        for subscriber in self.subscribers.values_mut() {
-            if subscriber.over_budget() {
-                subscriber.coalesce(&self.engine);
-            }
         }
         for (session_id, end) in ended {
             match (end.reason, &end.error) {
@@ -456,24 +303,12 @@ impl Feed {
                 }
             }
         }
-        #[cfg(test)]
-        self.tap_flush();
     }
 
     /// Queues the checkpoints that are due at `now` for the subscribers that
     /// follow their scopes; whether any was queued.
     pub(crate) fn checkpoints(&mut self, now: Instant) -> bool {
         let mut queued = false;
-        for scope in self.pacer.due(now) {
-            let Some(checkpoint) = self.engine.checkpoint(&scope) else {
-                continue;
-            };
-            queued = true;
-            let checkpoint = Encoded::new(checkpoint);
-            for subscriber in self.subscribers.values_mut() {
-                subscriber.publish(&checkpoint);
-            }
-        }
         for subscriber in self.tree_subscribers.values_mut() {
             queued |= subscriber.checkpoints(&self.tree, now);
         }
@@ -485,12 +320,11 @@ impl Feed {
         self.tree_subscribers
             .values()
             .filter_map(TreeSubscriber::deadline)
-            .chain(self.pacer.deadline())
             .min()
     }
 }
 
-/// The end of a revision 3 scope as a path of the tree ends.
+/// The registry's session end as the stream reports it.
 fn tree_end(end: &End) -> TreeEnd {
     TreeEnd {
         reason: match end.reason {
@@ -517,9 +351,9 @@ struct Shared {
 }
 
 impl FeedHandle {
-    pub(crate) fn new(process_epoch: impl Into<String>) -> Self {
+    pub(crate) fn new() -> Self {
         Self(Arc::new(Shared {
-            feed: Mutex::new(Feed::new(process_epoch)),
+            feed: Mutex::new(Feed::new()),
             ready: Notify::new(),
             closed: AtomicBool::new(false),
             closes: watch::channel(0).0,
@@ -553,20 +387,6 @@ impl FeedHandle {
         self.0.ready.notify_waiters();
     }
 
-    /// A subscription to `follow`, aligned with what is published now. Once the
-    /// feed is closed there is nothing to align or to wait for.
-    pub(crate) fn subscribe(&self, follow: &[Subscribed]) -> FeedSubscription {
-        let id = if self.0.closed.load(Ordering::SeqCst) {
-            self.feed().subscribe(&[])
-        } else {
-            self.feed().subscribe(follow)
-        };
-        FeedSubscription(Arc::new(SubscriptionGuard {
-            id,
-            handle: self.clone(),
-        }))
-    }
-
     pub(crate) fn clear_pending(&self, session_id: &str) {
         self.feed().clear_pending(session_id);
     }
@@ -580,22 +400,41 @@ impl FeedHandle {
         read(self.feed().tree())
     }
 
+    /// Reads the committed tree and its attachment index under one lock. A caller must not
+    /// re-enter the handle while reading; the two borrowed values belong to the same commit.
+    pub(crate) fn with_state<R>(&self, read: impl FnOnce(&Tree, &Projector) -> R) -> R {
+        let feed = self.feed();
+        read(&feed.tree, &feed.projector)
+    }
+
     /// A short subscription for a read: its views are kept for a while.
     pub(crate) fn subscribe_tree_reading(&self, query: &StreamQuery) -> TreeSubscription {
-        let id = self.feed().subscribe_tree_at(query, true);
-        TreeSubscription(FeedSubscription(Arc::new(SubscriptionGuard {
-            id,
-            handle: self.clone(),
-        })))
+        self.subscribe_tree_at(query, true)
     }
 
     /// A stream of revision 4 over the paths of `query`, its first event queued.
     pub(crate) fn subscribe_tree(&self, query: &StreamQuery) -> TreeSubscription {
-        let id = self.feed().subscribe_tree(query);
-        TreeSubscription(FeedSubscription(Arc::new(SubscriptionGuard {
+        self.subscribe_tree_at(query, false)
+    }
+
+    fn subscribe_tree_at(&self, query: &StreamQuery, linger: bool) -> TreeSubscription {
+        let mut feed = self.feed();
+        let id = if self.0.closed.load(Ordering::SeqCst) {
+            // A read can still inspect the final cut after shutdown. A new stream has no
+            // further events to follow; neither case materializes views or requests a load.
+            if linger {
+                let subscriber = TreeSubscriber::final_snapshot(query, &feed.tree);
+                feed.add_subscriber(subscriber)
+            } else {
+                0
+            }
+        } else {
+            feed.subscribe_tree_at(query, linger)
+        };
+        TreeSubscription(Arc::new(SubscriptionGuard {
             id,
             handle: self.clone(),
-        })))
+        }))
     }
 
     pub(crate) fn subscribers(&self) -> usize {
@@ -620,25 +459,9 @@ impl FeedHandle {
         self.0.ready.notify_waiters();
     }
 
-    /// The committed `live` of `scope`: what a write is admitted against.
-    pub(crate) fn live(&self, scope: &Scope) -> Option<Value> {
-        self.feed().live(scope)
-    }
-
     /// The block an attachment of a held session names, while a published entry references it.
     pub(crate) fn attachment(&self, session_id: &str, id: &str) -> Option<Value> {
         self.feed().attachment(session_id, id)
-    }
-
-    /// The whole document of `scope` as the snapshot a stream is aligned with (protocol §8): none
-    /// while the bridge does not hold it. It holds, loads and renews nothing.
-    pub(crate) fn snapshot(&self, scope: &str) -> Option<StreamEvent> {
-        self.feed().snapshot(scope)
-    }
-
-    /// The epoch and rev `scope` is published at, if it is.
-    pub(crate) fn version(&self, scope: &str) -> Option<(String, u64)> {
-        self.feed().version(scope)
     }
 
     /// Ends every subscription: the streams drain what is queued and finish.
@@ -663,68 +486,31 @@ impl Drop for SubscriptionGuard {
     }
 }
 
-/// One stream's side of a subscription. It forgets the subscription when the
-/// last clone is dropped.
+/// One stream's subscription, removed when the last clone is dropped.
 #[derive(Clone)]
-pub(crate) struct FeedSubscription(Arc<SubscriptionGuard>);
-
-impl FeedSubscription {
-    /// The next event to write; waits when none is queued, and is `None` once
-    /// the feed is closed and the queue is drained.
-    #[cfg(test)]
-    pub(crate) async fn next(&self) -> Option<StreamEvent> {
-        self.next_encoded().await.map(Encoded::into_event)
-    }
-
-    /// `next`, with the JSON it was encoded to once for every subscriber.
-    pub(crate) async fn next_encoded(&self) -> Option<Encoded> {
-        let handle = &self.0.handle;
-        loop {
-            // Enabled before the queue is read, so a commit between the two wakes
-            // this wait instead of being missed: `notify_waiters` reaches only
-            // a wait that is registered.
-            let ready = handle.0.ready.notified();
-            tokio::pin!(ready);
-            ready.as_mut().enable();
-            let deadline = {
-                let mut feed = handle.feed();
-                // The checkpoints due are queued for every stream, whichever one
-                // is waiting when they are.
-                if feed.checkpoints(Instant::now()) {
-                    handle.0.ready.notify_waiters();
-                }
-                if let Some(event) = feed.next_encoded(self.0.id) {
-                    return Some(event);
-                }
-                feed.deadline()
-            };
-            if handle.0.closed.load(Ordering::SeqCst) {
-                return None;
-            }
-            match deadline {
-                Some(deadline) => {
-                    tokio::select! {
-                        () = ready => {}
-                        () = tokio::time::sleep_until(deadline) => {}
-                    }
-                }
-                None => ready.await,
-            }
-        }
-    }
-}
-
-/// One revision 4 stream's side of a subscription.
-#[derive(Clone)]
-pub(crate) struct TreeSubscription(FeedSubscription);
+pub(crate) struct TreeSubscription(Arc<SubscriptionGuard>);
 
 impl TreeSubscription {
     /// The next event to write, as JSON; waits when none is queued, and is `None` once the feed
     /// is closed and the queue is drained.
     pub(crate) async fn next_json(&self) -> Option<String> {
-        let subscription = &self.0;
-        let handle = &subscription.0.handle;
+        self.next_event().await.map(|event| serde_json::to_string(&event).expect("an event serializes"))
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn next(&self) -> Option<TreeEvent> {
+        self.next_event().await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_next(&self) -> Option<TreeEvent> {
+        self.0.handle.feed().next_tree(self.0.id)
+    }
+
+    async fn next_event(&self) -> Option<TreeEvent> {
+        let handle = &self.0.handle;
         loop {
+            // Register before checking the queue so a concurrent commit cannot be missed.
             let ready = handle.0.ready.notified();
             tokio::pin!(ready);
             ready.as_mut().enable();
@@ -733,14 +519,16 @@ impl TreeSubscription {
                 if feed.checkpoints(Instant::now()) {
                     handle.0.ready.notify_waiters();
                 }
-                if let Some(event) = feed.next_tree(subscription.0.id) {
-                    return Some(serde_json::to_string(&event).expect("an event serializes"));
+                if let Some(event) = feed.next_tree(self.0.id) {
+                    return Some(event);
+                }
+                // Check closure while the empty queue is still locked. Otherwise a final
+                // commit followed by close could enqueue between these two observations.
+                if handle.0.closed.load(Ordering::SeqCst) {
+                    return None;
                 }
                 feed.deadline()
             };
-            if handle.0.closed.load(Ordering::SeqCst) {
-                return None;
-            }
             match deadline {
                 Some(deadline) => {
                     tokio::select! {
@@ -764,3 +552,6 @@ mod tree_tests;
 pub(crate) mod tap;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod perf_tests;

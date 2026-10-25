@@ -16,10 +16,8 @@ pub(crate) struct Published {
 impl Default for Published {
     fn default() -> Self {
         Self {
-            // Names the epoch `global` and `catalog` are published under: new
-            // for every bridge process, so that a client of an earlier one
-            // asks for the whole document.
-            feed: FeedHandle::new(super::op::operation_id()),
+            // A new instance per bridge process invalidates clients' previous holdings.
+            feed: FeedHandle::new(),
             waiting: Vec::new(),
         }
     }

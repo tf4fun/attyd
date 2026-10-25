@@ -1,8 +1,8 @@
 //! The revision 4 tree as the bridge's state projects it (docs/protocol-r4-design.md §4.2).
 //!
-//! A pure projection of the registry into the `Spec` the tree is committed from, built from
-//! the same projections as the revision 3 documents (`project`), so the two never disagree
-//! about what the bridge holds. The operation is split into its head and its detail (§4.4).
+//! A projection of the registry into the `Spec` the tree is committed from, keeping unchanged
+//! entry values and the attachment blocks their references name. The operation is split into
+//! its head and its detail (§4.4).
 #![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::BTreeMap;
@@ -19,7 +19,7 @@ use super::documents::{
 use super::hash::TextRule;
 use super::project;
 use super::timeline::{Entry, Prompt, Role, Timeline};
-use super::timeline_doc::{AttachmentIndex, publish_entry};
+use super::timeline_doc::{AttachmentIndex, publish_entry_referencing};
 use super::tree::Spec;
 use crate::session_registry::SessionRegistry;
 
@@ -237,6 +237,7 @@ pub(crate) struct OpRecord {
 pub(crate) const OP_LOG: usize = 64;
 
 /// What is remembered of the operations of one target.
+#[cfg_attr(test, derive(Clone))]
 #[derive(Default)]
 struct TargetLog {
     /// The `op.id` the target showed at the last commit; none before the first.
@@ -247,6 +248,7 @@ struct TargetLog {
 /// How many failed loads `/global/loadFailures` keeps (design §6.2).
 pub(crate) const LOAD_FAILURES: usize = 64;
 
+#[cfg_attr(test, derive(Clone))]
 #[derive(Default)]
 pub(crate) struct Projector {
     sessions: BTreeMap<String, Memo>,
@@ -258,9 +260,12 @@ pub(crate) struct Projector {
 }
 
 /// What is remembered of one held session.
+#[cfg_attr(test, derive(Clone))]
 #[derive(Default)]
 struct Memo {
-    entries: Vec<(Arc<Entry>, Arc<Value>)>,
+    entries: Vec<PublishedEntry>,
+    /// The blocks referenced by this session's published entries, counted per reference.
+    attachments: AttachmentIndex,
     /// The revision at which the bridge started holding the session this time (§4.2).
     held_since: u64,
     /// The timeline the history was last installed as, and the revision it was.
@@ -270,6 +275,13 @@ struct Memo {
     /// value they were published as (and the tree compares them by pointer).
     turns: Vec<(TurnHead, Arc<Value>)>,
     prompts: Vec<(Prompt, Arc<Value>)>,
+}
+
+#[cfg_attr(test, derive(Clone))]
+struct PublishedEntry {
+    source: Arc<Entry>,
+    value: Arc<Value>,
+    attachments: Vec<String>,
 }
 
 /// `items` as value nodes, an item equal to the one at its index in `cache` keeping that one's
@@ -289,6 +301,11 @@ fn reuse<T: Clone + PartialEq + Serialize>(cache: &mut Vec<(T, Arc<Value>)>, ite
 }
 
 impl Projector {
+    /// The exact block referenced by a currently published entry of this held session.
+    pub(crate) fn attachment(&self, session_id: &str, id: &str) -> Option<&Value> {
+        self.sessions.get(session_id)?.attachments.get(id)
+    }
+
     /// A load of `session_id` failed with `error`: kept until the session is held again or
     /// deleted, among the last `LOAD_FAILURES`.
     pub(crate) fn record_failure(&mut self, session_id: &str, error: ProtocolError) {
@@ -444,24 +461,28 @@ impl Projector {
                 }
                 let source = timeline.entries();
                 // Entries only change in place or grow; a shorter list is another history.
-                cache.truncate(source.len());
-                let mut index = AttachmentIndex::default();
+                for removed in cache.drain(source.len().min(cache.len())..) {
+                    memo.attachments.release(&removed.attachments);
+                }
                 for (position, entry) in source.iter().enumerate() {
                     match cache.get(position) {
-                        Some((cached, _)) if Arc::ptr_eq(cached, entry) => {}
+                        Some(cached) if Arc::ptr_eq(&cached.source, entry) => {}
                         _ => {
-                            let published = Arc::new(publish_entry(entry, &mut index));
+                            let (value, attachments) = publish_entry_referencing(entry, &mut memo.attachments);
+                            let published = PublishedEntry { source: Arc::clone(entry), value: Arc::new(value), attachments };
                             if position < cache.len() {
-                                cache[position] = (Arc::clone(entry), published);
+                                // Publish first: a block both versions reference stays retained.
+                                memo.attachments.release(&cache[position].attachments);
+                                cache[position] = published;
                             } else {
-                                cache.push((Arc::clone(entry), published));
+                                cache.push(published);
                             }
                         }
                     }
                 }
                 children.insert(
                     "entries".into(),
-                    Spec::List(cache.iter().map(|(_, value)| Spec::text_value(Arc::clone(value), TextRule::Entry)).collect()),
+                    Spec::List(cache.iter().map(|entry| Spec::text_value(Arc::clone(&entry.value), TextRule::Entry)).collect()),
                 );
                 children.insert(
                     "turns".into(),
@@ -471,6 +492,7 @@ impl Projector {
             }
             None => {
                 cache.clear();
+                memo.attachments = AttachmentIndex::default();
                 memo.turns.clear();
                 memo.prompts.clear();
                 children.insert("prompts".into(), Spec::List(Vec::new()));

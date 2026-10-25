@@ -615,6 +615,60 @@ fn a_catch_up_and_a_reconnect_carry_windows_too() {
 // --- what an end for a reason asks of the bridge --------------------------------------------
 
 #[test]
+fn a_load_failure_keeps_its_first_end_until_the_path_appears_again() {
+    use crate::protocol::documents::ErrorCode;
+    use crate::protocol::tree_doc::ErrorSummary;
+
+    let agent_error = End {
+        reason: EndReason::LoadFailed,
+        error: Some(ErrorSummary { code: ErrorCode::AgentError, agent_code: Some(-32600) }),
+    };
+    let unavailable = End {
+        reason: EndReason::LoadFailed,
+        error: Some(ErrorSummary { code: ErrorCode::Unavailable, agent_code: None }),
+    };
+    for published in [false, true] {
+        let path = "/sessions/s";
+        let mut tree = Tree::new("I");
+        tree.commit(if published { root(0, &[("s", session("loading", &[]))]) } else { root(0, &[]) });
+        let mut subscriber = Subscriber::new(&query(&[path]), &tree);
+        let mut client = Client::following(&[path]);
+        pump(&mut subscriber, &mut client);
+
+        if published {
+            let gone = committed(&mut tree, root(0, &[]));
+            subscriber.publish_ended(&tree, &gone, Instant::now(), &BTreeMap::from([("s".into(), agent_error.clone())]));
+        } else {
+            subscriber.end_session(&tree, "s", &agent_error);
+        }
+        // Final materialization cleanup must not replace the Agent's already queued error
+        // with its generic unavailable result, whether or not the load became visible.
+        subscriber.end_session(&tree, "s", &unavailable);
+        let first = subscriber.next().expect("the original failure is delivered");
+        assert_eq!(first.changes.as_ref().unwrap(), &vec![Change::End { path: path.into(), end: agent_error.clone() }]);
+        client.apply(&first).unwrap();
+        assert!(client.value(path).is_none());
+        assert!(subscriber.next().is_none(), "a queued terminal end is not repeated");
+        subscriber.end_session(&tree, "s", &unavailable);
+        assert!(subscriber.next().is_none(), "a delivered terminal end is not repeated");
+        assert_eq!(subscriber.followed().count(), 0);
+
+        let back = committed(&mut tree, root(0, &[("s", session("reloaded", &["answer"]))]));
+        subscriber.publish(&tree, &back);
+        assert_eq!(pump(&mut subscriber, &mut client), 1);
+        holds(&client, &tree, &[path]);
+        assert_eq!(subscriber.followed().collect::<Vec<_>>(), [path]);
+        let gone = committed(&mut tree, root(0, &[]));
+        subscriber.publish_ended(&tree, &gone, Instant::now(), &BTreeMap::from([("s".into(), unavailable.clone())]));
+        let next = subscriber.next().expect("the recovered path can end again");
+        assert_eq!(next.changes.as_ref().unwrap(), &vec![Change::End { path: path.into(), end: unavailable.clone() }]);
+        client.apply(&next).unwrap();
+        assert!(client.value(path).is_none());
+        assert!(subscriber.next().is_none());
+    }
+}
+
+#[test]
 fn a_path_that_ended_for_a_reason_asks_for_nothing_but_is_still_tracked_and_asks_again_when_it_is_there() {
     let mut tree = Tree::new("I");
     tree.commit(root(0, &[]));

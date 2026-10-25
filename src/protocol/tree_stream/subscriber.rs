@@ -12,7 +12,7 @@ use super::super::views::{self, Gone, View};
 use super::params::{StreamQuery, session_of};
 use super::snapshot::snapshot_windowed;
 use super::windowed_ops::windowed;
-use super::super::subscription::QUEUE_BUDGET;
+use super::QUEUE_BUDGET;
 use super::wire::{Change, Check, End, EndReason, Event};
 
 /// A queued event and the bytes it counts against the budget.
@@ -85,6 +85,17 @@ fn op_path(op: &Op) -> &str {
 }
 
 impl Subscriber {
+    /// One final read after shutdown: deliver the existing cut without holding a session,
+    /// requesting a load, or tracking subsequent publication.
+    pub(crate) fn final_snapshot(query: &StreamQuery, tree: &Tree) -> Self {
+        let mut subscriber = Self::new(query, tree);
+        for state in subscriber.paths.values_mut() {
+            state.demand = false;
+            state.over = true;
+        }
+        subscriber
+    }
+
     /// A subscriber for `query`, aligned with `tree`: its first event names the instance and
     /// carries, per followed path, a snapshot from the version the client holds when it holds
     /// the tree's instance, else a whole one.
@@ -307,7 +318,11 @@ impl Subscriber {
             .paths
             .iter_mut()
             .filter(|(path, state)| {
-                session_of(path).as_deref() == Some(session_id) && !state.present && !state.over && tree.get(path).is_none()
+                session_of(path).as_deref() == Some(session_id)
+                    && state.demand
+                    && !state.present
+                    && !state.over
+                    && tree.get(path).is_none()
             })
             .map(|(path, state)| {
                 state.demand = end.reason == EndReason::Absent;
