@@ -1,42 +1,11 @@
-// The client digest (protocol §5.5). SHA-256 is checked against the FIPS 180-4
-// vectors and against Node's own implementation at every length that crosses a
-// block boundary; the digests against the vectors an independent implementation
-// computed, which src/protocol/digest.rs reproduces too.
+// The primitives of the client's hashes (design §5). SHA-256 is checked against the FIPS 180-4
+// vectors and against Node's own implementation at every length that crosses a block boundary;
+// the hashes built on them are checked in protocol-r4-hash.test.ts.
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import {
-  canonicalJson,
-  entriesDigest,
-  entryHash,
-  hex,
-  scopeDigest,
-  sessionDigest,
-  sha256,
-  wire,
-} from "../shared/digest";
+import { canonicalJson, hex, sha256, wire } from "../shared/digest";
 
 const encoder = new TextEncoder();
-
-interface Vector {
-  name: string;
-  kind: "session" | "scope";
-  doc: Record<string, unknown>;
-  entryHashes?: string[] | null;
-  entriesDigest?: string;
-  digest: string;
-}
-
-const vectors = (
-  JSON.parse(readFileSync(new URL("./fixtures/protocol-digest-vectors.json", import.meta.url), "utf8")) as {
-    cases: Vector[];
-  }
-).cases;
-
-function split(doc: Record<string, unknown>): { head: Record<string, unknown>; entries: unknown[] | null } {
-  const { entries, ...head } = doc;
-  return { head, entries: (entries as unknown[] | undefined) ?? null };
-}
 
 describe("sha256", () => {
   it.each([
@@ -75,54 +44,8 @@ describe("canonicalJson", () => {
   });
 });
 
-describe("digests", () => {
-  it.each(vectors.map((vector) => [vector.name, vector] as const))("match the independent vector: %s", (_, vector) => {
-    if (vector.kind === "scope") {
-      expect(scopeDigest(vector.doc)).toBe(vector.digest);
-      return;
-    }
-    const { head, entries } = split(vector.doc);
-    const hashes = entries === null ? null : entries.map(entryHash);
-    expect(sessionDigest(head, hashes)).toBe(vector.digest);
-    expect(hashes === null ? null : hashes.map(hex)).toEqual(vector.entryHashes ?? null);
-    expect(hex(entriesDigest(hashes))).toBe(vector.entriesDigest);
-  });
-
-  it("tells an unknown history from an empty one", () => {
-    expect(hex(entriesDigest(null))).not.toBe(hex(entriesDigest([])));
-  });
-
+describe("wire", () => {
   it("writes a hash as 22 url-safe characters", () => {
     expect(wire(sha256(encoder.encode("abc")))).toMatch(/^[A-Za-z0-9_-]{22}$/);
-  });
-
-  it("changes with any part of the document and not with the key order", () => {
-    const document = {
-      epoch: "e",
-      rev: 1,
-      history: "complete",
-      entries: [{ kind: "message", role: "user", chunks: [] }],
-      prompts: [],
-      live: { closing: false },
-    };
-    const digest = (doc: Record<string, unknown>) => {
-      const { head, entries } = split(doc);
-      return sessionDigest(head, entries === null ? null : entries.map(entryHash));
-    };
-    const original = digest(document);
-    for (const changed of [
-      { ...document, epoch: "other" },
-      { ...document, rev: 2 },
-      { ...document, history: "partial" },
-      { ...document, prompts: [{ entry: 0 }] },
-      { ...document, live: { closing: true } },
-      { ...document, entries: [{ kind: "message", role: "agent", chunks: [] }] },
-    ]) {
-      expect(digest(changed)).not.toBe(original);
-    }
-    const reordered = JSON.parse(
-      '{"live":{"closing":false},"prompts":[],"history":"complete","entries":[{"chunks":[],"role":"user","kind":"message"}],"rev":1,"epoch":"e"}',
-    ) as Record<string, unknown>;
-    expect(digest(reordered)).toBe(original);
   });
 });

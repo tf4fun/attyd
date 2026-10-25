@@ -1,22 +1,23 @@
-// Resolving a write whose answer was lost, from the replica of the scope it was written to
-// (docs/protocol.md §6.5, §6.6). One case per row of the table.
+// Resolving a write whose answer was lost, from the log of the target it was written to
+// (docs/protocol-r4-design.md §9.3). The rows of the table themselves are checked in
+// protocol-r4-outcome.test.ts against the independent vectors.
 import { describe, expect, it } from "vitest";
+import type { TargetState } from "../shared/outcome";
 import {
   isOperationId,
   newOperationId,
   originOf,
   resolveWrite,
-  type ShownOperation,
   type Write,
 } from "../shared/write-resolution";
 
 const ID = "AAAAAAAAAAAAAAAAAAAAAA";
 const EXPECT = "BBBBBBBBBBBBBBBBBBBBBB";
 const OTHER = "CCCCCCCCCCCCCCCCCCCCCC";
-const write: Write = { id: ID, expect: EXPECT, scope: "global" };
+const write: Write = { id: ID, expect: EXPECT, scope: "global", instance: "I", at: 10 };
 
-function op(partial: Partial<ShownOperation>): ShownOperation {
-  return { id: OTHER, scope: "global", after: null, status: "running", ...partial };
+function target(partial: Partial<TargetState>): TargetState {
+  return { instance: "I", op: OTHER, heldSince: null, ops: [], ...partial };
 }
 
 describe("operation IDs", () => {
@@ -41,43 +42,30 @@ describe("operation IDs", () => {
 });
 
 describe("a write whose answer was lost", () => {
-  it("was admitted when the scope shows its operation", () => {
-    expect(resolveWrite(write, op({ id: ID, after: EXPECT }))).toBe("admitted");
-    expect(resolveWrite(write, op({ id: ID, status: "completed" }))).toBe("admitted");
+  it("was admitted when the target's log holds it, whatever followed", () => {
+    expect(resolveWrite(write, target({ op: ID, ops: [{ id: ID, after: EXPECT }] }))).toBe("admitted");
+    expect(resolveWrite(write, target({ ops: [{ id: ID, after: EXPECT }, { id: OTHER, after: ID }] }))).toBe("admitted");
   });
 
-  it("was not admitted when the scope still shows the operation it expected, ended", () => {
-    expect(resolveWrite(write, op({ id: EXPECT, status: "completed" }))).toBe("not_admitted");
-    expect(resolveWrite(write, op({ id: EXPECT, status: "failed" }))).toBe("not_admitted");
+  it("was definitely not admitted when another operation replaced the one it expected", () => {
+    expect(resolveWrite(write, target({ ops: [{ id: OTHER, after: EXPECT }] }))).toBe("not_admitted");
   });
 
-  it("is unknown when the expected operation is still running", () => {
-    expect(resolveWrite(write, op({ id: EXPECT, status: "running" }))).toBe("unknown");
+  it("is left to the user while the operation it expected is still the target's", () => {
+    expect(resolveWrite(write, target({ op: EXPECT }))).toBe("unknown");
   });
 
-  it("lost the race when another operation of the scope followed the same expectation", () => {
-    expect(resolveWrite(write, op({ id: OTHER, scope: "global", after: EXPECT }))).toBe("not_admitted");
-  });
-
-  it("was admitted and followed by another operation when that one's `after` is its id", () => {
-    expect(resolveWrite(write, op({ id: OTHER, scope: "global", after: ID }))).toBe("admitted");
-  });
-
-  it("is unknown for an operation written to another scope, whatever its `after`", () => {
-    // A fork from a session also occupies `global`: its `after` says nothing about `global`.
-    expect(resolveWrite(write, op({ id: OTHER, scope: "session/S", after: EXPECT }))).toBe("unknown");
-    expect(resolveWrite(write, op({ id: OTHER, scope: "session/S", after: ID }))).toBe("unknown");
-  });
-
-  it("is unknown for anything else, and when nothing is shown", () => {
-    expect(resolveWrite(write, op({ id: OTHER, after: OTHER }))).toBe("unknown");
+  it("is unknown when the bridge restarted, the session was held again, or the log no longer reaches back", () => {
+    expect(resolveWrite(write, target({ instance: "J", ops: [{ id: ID, after: EXPECT }] }))).toBe("unknown");
+    expect(resolveWrite(write, target({ heldSince: 11, ops: [{ id: ID, after: EXPECT }] }))).toBe("unknown");
+    expect(resolveWrite(write, target({ ops: [{ id: OTHER, after: "OLD" }] }))).toBe("unknown");
     expect(resolveWrite(write, undefined)).toBe("unknown");
   });
 
-  it("is judged on the scope it was written to", () => {
-    const inSession: Write = { id: ID, expect: EXPECT, scope: "session/S" };
-    expect(resolveWrite(inSession, op({ id: OTHER, scope: "global", after: EXPECT }))).toBe("unknown");
-    expect(resolveWrite(inSession, op({ id: OTHER, scope: "session/S", after: EXPECT }))).toBe("not_admitted");
+  it("is judged with the instance and version the client held, or the target's own when it does not say", () => {
+    const bare: Write = { id: ID, expect: EXPECT, scope: "global" };
+    expect(resolveWrite(bare, target({ heldSince: 3, ops: [{ id: ID, after: EXPECT }] }))).toBe("unknown");
+    expect(resolveWrite(bare, target({ ops: [{ id: ID, after: EXPECT }] }))).toBe("admitted");
   });
 });
 

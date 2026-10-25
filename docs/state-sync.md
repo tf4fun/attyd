@@ -553,6 +553,20 @@ closes it at the Agent when it is unneeded and `close` stays an action; no code.
 `ended` by the connection's end**: stays in the final documents until the next connection
 starts without it; no code.
 
+**Revision 4** ([specification](protocol.md), [design](protocol-r4-design.md), tracked in #203). Each step is one pull request into `experiment/protocol-v2`, tests first, commits checked by the draft pull request's fast validation and the whole suite once ready:
+
+| Step | Merged |
+| --- | --- |
+| 1 — state tree and versions | the versioned tree, its projection of the registry (`op` head and `opDetail`, `heldSince`, `historyRev`, the turn index), committed by the feed beside the scopes (#204) |
+| 2 — hashes | independent vectors; text chains, value, object, map and list hashes in Rust and TypeScript; node hashes in the tree (#205) |
+| 3 — the stream | path follows, per-path version chains, differential snapshots, checkpoints, coalescing, `/global/loadFailures`, served beside revision 3 (#206) |
+| 4 — windows and segments | text windows with bounded events, segment reads (#207) |
+| 5 — operation log and targets | the bounded `ops` log, the four outcomes (Rust and TypeScript on one set of vectors), target writes and the resolution read (#208) |
+| 6 — views, holding, ordering | derived views in the revision of their commit, fixed views ending `absent` / `replaced`, `GET /api/v2/nodes/{path}` as a short subscription that opens, holds and releases a session, request ordering across instances (#209) |
+| 7 — the browser | the tree replica, stream client and scope documents in `shared/`; writes to targets; the thread projected by the published turns; revision 3's TypeScript and its HTTP surface removed; the protocol document rewritten (#210) |
+
+The internal revision 3 publisher (the engine and the per-scope feed) remains in the bridge as the source of admission (`live` of a scope) and attachments; it serves no endpoint and is to be folded into the tree.
+
 A self-review of the whole implementation, with what it found, fixed and did not cover, is in
 [self-review.md](self-review.md).
 

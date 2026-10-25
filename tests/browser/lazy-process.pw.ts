@@ -1,7 +1,7 @@
 import { expect, test as baseTest } from "@playwright/test";
 import { join } from "node:path";
 import { startRustTestServer } from "../../scripts/rust-test-server";
-import { opsOf, trackApi } from "./api-requests";
+import { opsOf, scopesOf, trackApi } from "./api-requests";
 
 const SESSION_ID = "lazy-process-session";
 const FINAL_ANSWER = "The final answer is available without loading execution details.";
@@ -30,7 +30,7 @@ test("loads the whole history, tools included, folded in its turns, and never re
   const turn = page.locator(".conversation-turn").filter({ hasText: FINAL_ANSWER });
   await expect(turn.getByText(FINAL_ANSWER, { exact: true })).toBeVisible();
   await expect(turn.locator(".message-user")).toContainText("Inspect the recorded execution process.");
-  expect(api.streams.map((url) => url.searchParams.getAll("scope"))).toContainEqual(
+  expect(api.streams.map(scopesOf)).toContainEqual(
     expect.arrayContaining([`session/${SESSION_ID}`]),
   );
   // The tools are in the thread, folded behind the disclosure, and nothing was asked for them.

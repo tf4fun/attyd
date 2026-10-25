@@ -5,6 +5,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Conversation } from "../web/src/components/acp/conversation";
 import { projectEntries } from "../web/src/lib/entry-projection";
+import { turnHeads } from "../web/src/dev/turn-heads";
 import type { Entry } from "../shared/entries";
 
 const parsed = vi.hoisted(() => [] as string[]);
@@ -46,7 +47,7 @@ describe("a thread update", () => {
     const render = (entries: Entry[]) => act(async () => root.render(
       // Fresh handlers, terminals and activity each time, as the page passes them.
       <Conversation
-        timeline={projectEntries("S", entries, [{ entry: 0 }]).timeline}
+        timeline={projectEntries("S", entries, [{ entry: 0 }], turnHeads(entries, [{ entry: 0 }])).timeline}
         terminalSnapshots={[]}
         agentActivity={{ kind: "responding" }}
         onReusePrompt={() => {}}
@@ -70,7 +71,7 @@ describe("a thread update", () => {
     const first = vi.fn();
     const latest = vi.fn();
     const entries = [message("user", "question"), message("agent", "answer")];
-    const timeline = projectEntries("S", entries, [{ entry: 0, end: { response: { stopReason: "end_turn" } } }]).timeline;
+    const timeline = projectEntries("S", entries, [{ entry: 0, end: { response: { stopReason: "end_turn" } } }], turnHeads(entries, [{ entry: 0, end: { response: { stopReason: "end_turn" } } }])).timeline;
     for (const onReusePrompt of [first, latest]) {
       await act(async () => root.render(
         <Conversation timeline={timeline} canReusePrompt onReusePrompt={onReusePrompt} settled />,

@@ -1,7 +1,6 @@
 //! `GET /api/v2/stream?follow=…` over real HTTP (protocol revision 4 §6): path streams of the
 //! state tree beside the scope streams.
 
-use super::feed::{event, open};
 use super::*;
 
 /// The next event that has `changes` or `check`, as a whole.
@@ -437,4 +436,120 @@ async fn a_read_of_a_view_materializes_it_and_a_second_read_finds_it_unchanged()
     };
     let (_, body) = read(&server, &format!("{path}?instance={instance}&have={at}")).await;
     assert_eq!(body["unchanged"], true, "the view was kept for the poll: {body}");
+}
+
+// --- the connection a followed session needs (S6, Q2) and closing ------------------------
+
+/// The next change of `path` that ends it for a reason: that it is not there is not one.
+async fn end_of(sse: &mut Sse, path: &str) -> Value {
+    loop {
+        let event = next(sse).await;
+        let found = event["changes"].as_array().and_then(|changes| {
+            changes.iter().find(|c| c["path"] == path && c["end"]["reason"].is_string() && c["end"]["reason"] != "absent")
+        });
+        if let Some(change) = found {
+            return change.clone();
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_stream_that_follows_a_session_starts_the_next_connection_and_keeps_the_session() {
+    let (mut server, mut link) = Server::start(json!({"loadSession": true})).await;
+    let (_, sse) = open(
+        &server,
+        &format!("follow=/global&follow=/sessions/saved/op&cwd={}", query_scope(&format!("saved:{CWD}"))),
+    )
+    .await;
+    link.serve_load("saved", &turns(&[("one", "1")])).await;
+    // Wait until the session is held with its history.
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let (status, read) = server.read("session/saved").await;
+        if status == StatusCode::OK && read["snapshot"]["doc"]["history"] == "complete" {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "never loaded");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // The Agent connection ends: the stream needs the next one, and the session is loaded on it.
+    link.close().await;
+    let mut next = server.agents.accept(json!({"loadSession": true})).await;
+    let load = next.serve_load("saved", &turns(&[("one", "1")])).await;
+    assert_eq!(load["params"]["sessionId"], "saved");
+    assert_eq!(server.agents.accepted(), 2);
+
+    // The stream never ended the session; its document is back to a completed load.
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let (status, read) = server.read("session/saved").await;
+        let op = &read["snapshot"]["doc"]["live"]["op"];
+        if status == StatusCode::OK && op["kind"] == "load" && op["status"] == "completed" {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "never reattached: {read}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    drop(sse.body);
+}
+
+#[tokio::test]
+async fn closing_a_session_ends_its_path_with_closed_for_the_streams_that_follow_it() {
+    let (server, mut link) = Server::start(json!({"sessionCapabilities": {"close": {}}})).await;
+    server.create(&mut link, "s1").await;
+    let (_, mut sse) = open(&server, "follow=/sessions/s1/op").await;
+    next(&mut sse).await;
+
+    let address = server.address;
+    let closing = tokio::spawn(async move {
+        send(address, Method::POST, "/api/v2/targets/sessions/s1/actions/close", Some(json!({})))
+            .await
+            .status()
+    });
+    let request = link.request("session/close").await;
+    link.reply(&request, json!({})).await;
+    assert_eq!(closing.await.unwrap(), StatusCode::OK);
+    let end = end_of(&mut sse, "/sessions/s1/op").await;
+    assert_eq!(end["end"]["reason"], "closed", "{end}");
+}
+
+#[tokio::test]
+async fn a_close_the_agent_refuses_ends_nothing() {
+    let (server, mut link) = Server::start(json!({"sessionCapabilities": {"close": {}}})).await;
+    server.create(&mut link, "s1").await;
+    let (_, mut sse) = open(&server, "follow=/sessions/s1/op").await;
+    next(&mut sse).await;
+
+    let address = server.address;
+    let closing = tokio::spawn(async move {
+        send(address, Method::POST, "/api/v2/targets/sessions/s1/actions/close", Some(json!({})))
+            .await
+            .status()
+    });
+    let request = link.request("session/close").await;
+    link.refuse(&request).await;
+    closing.await.unwrap();
+    // The session is still there for the stream to follow.
+    while let Some(event) = event(&mut sse, Duration::from_millis(500)).await {
+        let ends = event["changes"].as_array().into_iter().flatten().filter(|change| change.get("end").is_some());
+        assert_eq!(ends.count(), 0, "{event}");
+    }
+}
+
+// --- what revision 3 served is gone --------------------------------------------------------
+
+#[tokio::test]
+async fn the_scope_documents_and_the_scope_streams_of_revision_3_are_not_served() {
+    let (server, _link) = Server::start(json!({})).await;
+    for path in ["/api/v2/scopes/global", "/api/v2/scopes/session%2Fs"] {
+        let response = server.send(path).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+    }
+    let (status, _) = post(&server, "/api/v2/scopes/global/ops", json!({})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    for query in ["scope=global", "scope=global&have=global:e:1", ""] {
+        let (status, _) = open(&server, query).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query:?}");
+    }
 }

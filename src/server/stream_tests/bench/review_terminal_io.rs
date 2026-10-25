@@ -113,14 +113,14 @@ esac"#,
     let data = format!("{}\ninput-backpressure-complete\n", "x".repeat(512 * 1024));
     let address = bench.address;
     let path = format!(
-        "/api/v2/scopes/global/resources/{}/input",
+        "/api/v2/targets/global/resources/{}/input",
         encoded(&terminal)
     );
     let mut input = tokio::spawn(async move {
         body_of(send(address, Method::POST, &path, Some(json!({"data": data}))).await).await
     });
     let mut read = tokio::spawn(async move {
-        body_of(send(address, Method::GET, "/api/v2/scopes/global", None).await).await
+        body_of(send(address, Method::GET, "/api/v2/nodes/global", None).await).await
     });
     let deadline = tokio::time::Instant::now() + WAIT;
     let (input_result, read_result) = tokio::join!(

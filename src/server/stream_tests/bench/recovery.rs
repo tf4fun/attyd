@@ -114,7 +114,7 @@ async fn sign_in(address: SocketAddr) {
     let started = send(
         address,
         Method::POST,
-        "/api/v2/scopes/global/ops",
+        "/api/v2/targets/global/ops",
         Some(json!({
             "expect": expect,
             "kind": "terminal_login",
@@ -137,7 +137,7 @@ async fn sign_in(address: SocketAddr) {
     let input = send(
         address,
         Method::POST,
-        &format!("/api/v2/scopes/global/resources/{login}/input"),
+        &format!("/api/v2/targets/global/resources/{login}/input"),
         Some(json!({"data": "open-sesame\r"})),
     )
     .await;
@@ -171,7 +171,6 @@ async fn until_ready_again(stream: &mut Watch) {
 async fn after_an_agent_eof_reads_serve_the_last_documents_and_a_global_stream_restarts_nothing() {
     let (server, link) = Bench::start(json!({})).await;
     let mut stream = server.watch("scope=global&scope=catalog").await;
-    stream.event().await;
     stream.event().await;
     link.close().await;
     until_phase(&mut stream, &["stopped", "error"]).await;
@@ -262,8 +261,7 @@ async fn a_new_global_stream_aligns_while_initialize_is_unanswered() {
 
     let mut stream = server.watch("scope=global").await;
     let aligned = stream.event().await;
-    assert_eq!(aligned["scope"], "global", "{aligned}");
-    let agent = &aligned["snapshot"]["doc"]["live"]["agent"];
+    let agent = &stream.live("global")["agent"];
     assert_eq!(agent["phase"], "initializing", "{aligned}");
     assert!(agent["initialize"].is_null(), "{aligned}");
 
@@ -289,7 +287,7 @@ async fn a_known_session_aligns_on_a_new_stream_while_the_next_initialize_is_una
     // A held session needs no cwd; its known entries align at once.
     let mut second = server.watch("scope=session%2Fsaved").await;
     let aligned = second.event().await;
-    assert_eq!(aligned["scope"], "session/saved", "{aligned}");
+    assert!(second.has("session/saved"), "{aligned}");
     assert_eq!(second.entries("session/saved"), before["entries"].as_array().unwrap().clone());
     assert_eq!(second.live("session/saved")["op"]["kind"], "load");
     assert_eq!(second.live("session/saved")["op"]["status"], "running");
@@ -396,7 +394,7 @@ async fn a_cold_load_cut_by_an_eof_keeps_the_session_followed_and_converges_on_t
     let load = link.request("session/load").await;
     assert_eq!(load["params"]["sessionId"], "saved");
     let aligned = stream.event().await;
-    assert_eq!(aligned["scope"], "session/saved", "{aligned}");
+    assert!(stream.has("session/saved"), "{aligned}");
     assert_eq!(stream.live("session/saved")["op"]["kind"], "load", "{aligned}");
     assert_eq!(stream.live("session/saved")["op"]["status"], "running", "{aligned}");
     for update in &replay[..2] {
@@ -512,8 +510,10 @@ async fn review_shutdown_during_initialize_publishes_a_final_agent_before_closin
     link.close().await;
     for message in String::from_utf8(delivered).unwrap().split("\n\n") {
         if let Some(event) = Watch::parse(message) {
-            assert_eq!(event["scope"], "global", "{event}");
-            assert!(event.get("end").is_none(), "{event}");
+            for change in event["changes"].as_array().into_iter().flatten() {
+                assert_eq!(change["path"], "/global", "{event}");
+                assert!(change.get("end").is_none(), "{event}");
+            }
             stream.take(&event);
         }
     }

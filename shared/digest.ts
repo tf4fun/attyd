@@ -1,17 +1,10 @@
-// Document digests (docs/protocol.md §5.5), the client half of src/protocol/digest.rs.
+// The primitives of the client's hashes (docs/protocol-r4-design.md §5): SHA-256, JCS and the
+// form a hash takes on the wire. The hashes of the tree are built on them in `tree-hash.ts`.
 //
-// A client recomputes the digest over the replica it holds and compares it with
-// the bridge's. Entries are hashed one by one so a change to one entry costs one
-// hash; callers keep the hashes of entries they have not changed.
-//
-//   e_i    = SHA-256(canon(entries[i]))
-//   E      = SHA-256(e_0 ‖ e_1 ‖ …)              (no entries known: SHA-256("unknown"))
-//   digest = SHA-256(canon(head) ‖ E)            (global, catalog: SHA-256(canon(doc)))
-//
-// SHA-256 is synchronous and has no dependency: `crypto.subtle` is missing on
-// non-secure origins, where the workspace may still be opened. `canon` is JCS
-// (RFC 8785); JSON numbers are the doubles a browser holds, so integers beyond
-// ±2^53 are outside this digest (attachment identity does not use it).
+// SHA-256 is synchronous and has no dependency: `crypto.subtle` is missing on non-secure origins,
+// where the workspace may still be opened. `canon` is JCS (RFC 8785); JSON numbers are the doubles
+// a browser holds, so integers beyond ±2^53 are outside these hashes (attachment identity does not
+// use them).
 
 export type Hash = Uint8Array;
 
@@ -122,47 +115,11 @@ export function canonicalJson(value: unknown): string {
   }
 }
 
-const encoder = new TextEncoder();
-
-function concat(parts: readonly Uint8Array[]): Uint8Array {
-  const out = new Uint8Array(parts.reduce((total, part) => total + part.length, 0));
-  let offset = 0;
-  for (const part of parts) {
-    out.set(part, offset);
-    offset += part.length;
-  }
-  return out;
-}
-
-/** `e_i`: the hash of one entry as it is published. */
-export function entryHash(entry: unknown): Hash {
-  return sha256(encoder.encode(canonicalJson(entry)));
-}
-
-/** `E`: the digest of the entry hashes in order; `null` while the history is unknown. */
-export function entriesDigest(hashes: readonly Hash[] | null): Hash {
-  return sha256(hashes === null ? encoder.encode("unknown") : concat(hashes));
-}
-
 /** A hash on the wire: the unpadded base64url of its first 16 bytes. */
 export function wire(hash: Hash): string {
   let binary = "";
   for (const byte of hash.subarray(0, 16)) binary += String.fromCharCode(byte);
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
-/**
- * The digest of a session document: `head` is the document without its entries
- * (`epoch`, `rev`, `history`, `prompts`, `live`; `history` absent while unknown),
- * `entries` their hashes, or `null` while the history is unknown.
- */
-export function sessionDigest(head: unknown, entries: readonly Hash[] | null): string {
-  return wire(sha256(concat([encoder.encode(canonicalJson(head)), entriesDigest(entries)])));
-}
-
-/** The digest of a `global` or `catalog` document (`epoch`, `rev`, `live`). */
-export function scopeDigest(document: unknown): string {
-  return wire(sha256(encoder.encode(canonicalJson(document))));
 }
 
 /** Lowercase hexadecimal, for tests and logs. */

@@ -1,4 +1,5 @@
-//! `GET /api/v2/stream` and `GET /api/v2/scopes/{scope}` over real HTTP (protocol §5, §8).
+//! `GET /api/v2/stream`, the reads of nodes and the writes to targets over real HTTP (protocol
+//! revision 4 §6–§9).
 //!
 //! The server listens on a TCP port and its bridge connects to a scripted
 //! Agent over the WebSocket transport, so each Agent connection is a real ACP
@@ -19,7 +20,6 @@ use super::*;
 
 mod actions;
 mod bench;
-mod feed;
 mod tree;
 
 const WAIT: Duration = Duration::from_secs(10);
@@ -337,20 +337,11 @@ impl Server {
         send(self.address, Method::GET, path, None).await
     }
 
-    /// `GET /api/v2/scopes/{scope}`: the status and the JSON body.
+    /// The document of `scope` as scopes were once read: the status and the JSON body
+    /// `{ scope, snapshot: { epoch, rev, digest, doc, entries? } }`, made from a read of the
+    /// scope's node. A scope that is not there, as an unheld session, is `404`.
     async fn read(&self, scope: &str) -> (StatusCode, Value) {
-        let path = format!("/api/v2/scopes/{}", scope.replace('/', "%2F"));
-        let response = self.send(&path).await;
-        let status = response.status();
-        let bytes = axum::body::to_bytes(Body::new(response.into_body()), usize::MAX)
-            .await
-            .unwrap();
-        let body = if bytes.is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(&bytes).unwrap()
-        };
-        (status, body)
+        read_scope_snapshot(self.address, scope).await
     }
 
     /// Creates `session_id` through a `create` on `global`: the write is accepted before the
@@ -364,7 +355,7 @@ impl Server {
         let created = send(
             self.address,
             Method::POST,
-            "/api/v2/scopes/global/ops",
+            "/api/v2/targets/global/ops",
             Some(body),
         )
         .await;
@@ -413,6 +404,41 @@ async fn send(
 }
 
 
+/// `GET /api/v2/stream?…`: the status and the SSE body.
+async fn open(server: &Server, query: &str) -> (StatusCode, Sse) {
+    let response = server.send(&format!("/api/v2/stream?{query}")).await;
+    let status = response.status();
+    if status == StatusCode::OK {
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "text/event-stream");
+    }
+    let sse = Sse {
+        body: Body::new(response.into_body()).into_data_stream(),
+        buffer: String::new(),
+    };
+    (status, sse)
+}
+
+/// The next event of the stream, skipping comments (the heartbeat).
+async fn event(sse: &mut Sse, period: Duration) -> Option<Value> {
+    let deadline = tokio::time::Instant::now() + period;
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let message = sse.message(left).await?;
+        assert!(
+            message.lines().all(|line| !line.starts_with("id:")),
+            "events carry no SSE id: {message:?}"
+        );
+        let data: Vec<&str> = message
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(str::trim_start)
+            .collect();
+        if !data.is_empty() {
+            return Some(serde_json::from_str(&data.join("\n")).unwrap());
+        }
+    }
+}
+
 /// An SSE response body, read message by message.
 struct Sse {
     body: axum::body::BodyDataStream,
@@ -436,6 +462,34 @@ impl Sse {
         .await
         .ok()
         .flatten()
+    }
+}
+
+/// A read of the node of `scope`, as the document of the scope it holds (design §7.1).
+async fn read_scope_snapshot(address: SocketAddr, scope: &str) -> (StatusCode, Value) {
+    use crate::protocol::tree_stream::documents::{path_of, snapshot_body};
+    let encoded: String = path_of(scope)
+        .bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || b"-._~/".contains(&byte) {
+                (byte as char).to_string()
+            } else {
+                format!("%{byte:02X}")
+            }
+        })
+        .collect();
+    let path = format!("/api/v2/nodes{encoded}");
+    let response = send(address, Method::GET, &path, None).await;
+    let status = response.status();
+    let body = json_of(response).await;
+    let value = &body["change"]["snapshot"]["node"]["v"];
+    let at = body["change"]["snapshot"]["at"].as_u64().unwrap_or(0);
+    match snapshot_body(scope, body["instance"].as_str().unwrap_or(""), at, value) {
+        Some(snapshot) if status == StatusCode::OK => (StatusCode::OK, snapshot),
+        _ => (
+            StatusCode::NOT_FOUND,
+            json!({"error": {"code": "not_found", "message": format!("{scope} is not there")}}),
+        ),
     }
 }
 

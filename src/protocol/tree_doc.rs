@@ -9,6 +9,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde::Serialize;
+#[cfg(test)]
+use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use super::documents::{
@@ -36,6 +38,7 @@ pub(crate) struct OpHead {
 }
 
 /// What a writer needs to know about an error: whether it failed and how.
+#[cfg_attr(test, derive(Deserialize))]
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ErrorSummary {

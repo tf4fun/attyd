@@ -1,6 +1,8 @@
-//! The bench of the operation tests: writes through `POST /api/v2/scopes/{scope}/ops` and the
-//! actions, reads through `GET /api/v2/scopes/{scope}`, and watches of `GET /api/v2/stream`
-//! whose replicas are built from the events alone (protocol §5, §6, §8).
+//! The bench of the operation tests: writes through `POST /api/v2/targets/{target}/ops` and the
+//! actions, reads through `GET /api/v2/nodes/{path}`, and watches of `GET /api/v2/stream`
+//! whose replicas are built from the events alone (protocol revision 4 §6–§9). The tests keep
+//! speaking of scopes and their documents: a scope is the node at its path, and a document is
+//! read back from it as it was once published.
 //!
 //! A write is answered `202` when it is admitted; the result of `create`, `fork` and `list` is in
 //! the document, so `spawn_op` waits for it there. A watched document is only compared with a
@@ -35,9 +37,17 @@ fn ws_options(agents: &Agents) -> Options {
         .unwrap()
 }
 
+/// The target of a scope: `global`, `catalog` or `sessions/<id>`.
+fn target_of(scope: &str) -> String {
+    match scope.strip_prefix("session/") {
+        Some(id) => format!("sessions/{}", encoded(id)),
+        None => scope.to_string(),
+    }
+}
+
 /// The path of a scope's ops.
 fn ops_path(scope: &str) -> String {
-    format!("/api/v2/scopes/{}/ops", encoded(scope))
+    format!("/api/v2/targets/{}/ops", target_of(scope))
 }
 
 /// Percent-encodes one path segment: a session scope's `/` included.
@@ -74,10 +84,9 @@ async fn body_of(response: Response<hyper::body::Incoming>) -> (StatusCode, Valu
     (status, body)
 }
 
-/// `GET /api/v2/scopes/{scope}` at `address`.
+/// The document of `scope` at `address`, read from its node.
 async fn read_scope(address: SocketAddr, scope: &str) -> (StatusCode, Value) {
-    let path = format!("/api/v2/scopes/{}", encoded(scope));
-    let (status, body) = body_of(send(address, Method::GET, &path, None).await).await;
+    let (status, body) = read_scope_snapshot(address, scope).await;
     if status == StatusCode::OK {
         (status, Replica::from_snapshot(&body).doc)
     } else {
@@ -85,15 +94,42 @@ async fn read_scope(address: SocketAddr, scope: &str) -> (StatusCode, Value) {
     }
 }
 
+/// The query of a stream in revision 4's terms for one in the scopes the tests speak: `scope=<s>`
+/// follows the node at its path, `cwd=<scope>:<dir>` gives the directory to load that session with.
+fn follow_query(query: &str) -> (String, Vec<String>) {
+    use crate::protocol::tree_stream::documents::path_of;
+    let mut paths = Vec::new();
+    let mut out = Vec::new();
+    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        match key.as_ref() {
+            "scope" => {
+                let path = path_of(&value);
+                out.push(format!("follow={}", query_scope(&path)));
+                paths.push(path);
+            }
+            "cwd" => {
+                let (scope, dir) = value.split_once(':').expect("cwd is <scope>:<dir>");
+                let id = scope.strip_prefix("session/").expect("a session scope");
+                out.push(format!("cwd={}", query_scope(&format!("{}:{dir}", query_scope(id)))));
+            }
+            _ => out.push(format!("{}={}", query_scope(&key), query_scope(&value))),
+        }
+    }
+    (out.join("&"), paths)
+}
+
 /// `GET /api/v2/stream?…` at `address`, applied to replicas.
 async fn watch_at(address: SocketAddr, query: &str) -> Watch {
+    let (query, paths) = follow_query(query);
     let response = send(address, Method::GET, &format!("/api/v2/stream?{query}"), None).await;
     assert_eq!(response.status(), StatusCode::OK, "{query}");
+    let followed: Vec<&str> = paths.iter().map(String::as_str).collect();
     Watch {
         sse: Sse {
             body: Body::new(response.into_body()).into_data_stream(),
             buffer: String::new(),
         },
+        client: crate::protocol::tree_stream::client::Client::following(&followed),
         replicas: BTreeMap::new(),
         ended: BTreeMap::new(),
         events: Vec::new(),
@@ -162,7 +198,7 @@ impl Bench {
         body_of(response).await
     }
 
-    /// `POST /api/v2/scopes/{scope}/ops`.
+    /// `POST /api/v2/targets/{target}/ops`.
     async fn op(&self, scope: &str, expect: &Value, kind: &str, args: Value) -> (StatusCode, Value) {
         self.call(
             Method::POST,
@@ -201,7 +237,7 @@ impl Bench {
         body: Value,
     ) -> JoinHandle<(StatusCode, Value)> {
         let address = self.address;
-        let path = format!("/api/v2/scopes/{}/actions/{action}", encoded(&format!("session/{session_id}")));
+        let path = format!("/api/v2/targets/sessions/{}/actions/{action}", encoded(session_id));
         tokio::spawn(async move { body_of(send(address, Method::POST, &path, Some(body)).await).await })
     }
 
@@ -261,13 +297,13 @@ impl Bench {
         self.op(scope, op, "cancel", json!({})).await
     }
 
-    /// `POST /api/v2/scopes/{scope}/resources/{resourceId}/{action}`.
+    /// `POST /api/v2/targets/{target}/resources/{resourceId}/{action}`.
     async fn act(&self, scope: &str, resource: &str, action: &str, body: Value) -> (StatusCode, Value) {
         self.call(
             Method::POST,
             &format!(
-                "/api/v2/scopes/{}/resources/{}/{action}",
-                encoded(scope),
+                "/api/v2/targets/{}/resources/{}/{action}",
+                target_of(scope),
                 encoded(resource)
             ),
             Some(body),
@@ -279,7 +315,7 @@ impl Bench {
         self.call(Method::GET, path, None).await
     }
 
-    /// `GET /api/v2/scopes/{scope}`: the document `{ live, prompts, entries?, … }` the replica
+    /// The document `{ live, prompts, entries?, … }` the replica
     /// of a client would hold, or the refusal.
     async fn read_document(&self, scope: &str) -> (StatusCode, Value) {
         read_scope(self.address, scope).await
@@ -387,11 +423,13 @@ fn not_found(status: StatusCode, body: &Value, what: &str) {
 // ---------------------------------------------------------------------------
 // A watch
 
-/// An HTTP SSE stream whose events are applied to replicas.
+/// An HTTP SSE stream whose events are applied to replicas: the paths of the tree it follows,
+/// and the documents of the scopes they are the roots of.
 struct Watch {
     sse: Sse,
+    client: crate::protocol::tree_stream::client::Client,
     replicas: BTreeMap<String, Replica>,
-    /// How each scope ended, if it did.
+    /// How each scope that ended, with a reason, ended.
     ended: BTreeMap<String, Value>,
     /// Every event taken, in order.
     events: Vec<Value>,
@@ -414,28 +452,56 @@ impl Watch {
 
     /// Applies `event` to the replicas.
     fn take(&mut self, event: &Value) {
-        let scope = event["scope"].as_str().expect("an event names its scope").to_string();
-        assert!(!self.ended.contains_key(&scope), "an event after end: {event}");
-        if let Some(end) = event.get("end") {
-            self.replicas.remove(&scope);
-            self.ended.insert(scope, end.clone());
-        } else {
-            self.replicas
-                .entry(scope)
-                .or_default()
-                .apply(event)
-                .unwrap_or_else(|error| panic!("invalid HTTP SSE event: {error}"));
+        use crate::protocol::tree_stream::documents::{document, scope_of};
+        let wire: crate::protocol::tree_stream::wire::Event = serde_json::from_value(event.clone())
+            .unwrap_or_else(|error| panic!("not an event of the stream: {error}: {event}"));
+        self.client
+            .apply(&wire)
+            .unwrap_or_else(|error| panic!("invalid HTTP SSE event: {error}: {event}"));
+        let instance = self.client.instance.clone().unwrap_or_default();
+        for change in event["changes"].as_array().into_iter().flatten() {
+            let Some(scope) = change["path"].as_str().and_then(scope_of) else { continue };
+            let path = change["path"].as_str().unwrap();
+            match self.client.value(path).and_then(|value| document(&scope, value)) {
+                Some(doc) => {
+                    self.ended.remove(&scope);
+                    self.replicas.insert(
+                        scope,
+                        Replica { epoch: instance.clone(), rev: self.client.version(path), doc },
+                    );
+                }
+                None => {
+                    self.replicas.remove(&scope);
+                    // A path not there yet is not an end.
+                    if let Some(end) = change.get("end").filter(|end| end["reason"] != "absent") {
+                        let mut ended = json!({ "reason": end["reason"] });
+                        if let Some(error) = end.get("error") {
+                            ended["error"] = json!({ "code": error["code"] });
+                            if let Some(agent) = error.get("agentCode") {
+                                ended["error"]["data"] = json!({ "code": agent });
+                            }
+                        }
+                        self.ended.insert(scope, ended);
+                    }
+                }
+            }
         }
         self.events.push(event.clone());
     }
 
-    /// The next event, skipping comments (the heartbeat), applied.
+    /// The next event, skipping comments (the heartbeat) and events that only say a path is not
+    /// there yet, applied.
     async fn event(&mut self) -> Value {
         loop {
             let message = self.sse.message(WAIT).await.expect("the stream sent no event");
             if let Some(event) = Self::parse(&message) {
                 self.take(&event);
-                return event;
+                let nothing_yet = event["changes"].as_array().is_some_and(|changes| {
+                    changes.iter().all(|change| change["end"]["reason"] == "absent")
+                });
+                if !nothing_yet {
+                    return event;
+                }
             }
         }
     }
@@ -505,7 +571,7 @@ impl Watch {
             };
             if let Some(event) = Self::parse(&message) {
                 assert!(
-                    event.get("digest").is_some() && event.get("ops").is_none(),
+                    event.get("check").is_some() && event.get("changes").is_none(),
                     "unexpected event {message:?}"
                 );
                 self.take(&event);
@@ -584,12 +650,15 @@ fn url_elicitation(scope: Value, elicitation_id: &str) -> Value {
     params
 }
 
-/// The paths of the ops of an event.
+/// The paths of the ops of an event, relative to the path each belongs to.
 fn patch_paths(event: &Value) -> Vec<String> {
-    event["ops"]
+    event["changes"]
         .as_array()
-        .map(|ops| ops.iter().map(|op| op["path"].as_str().unwrap().to_string()).collect())
-        .unwrap_or_default()
+        .into_iter()
+        .flatten()
+        .flat_map(|change| change["ops"].as_array().into_iter().flatten())
+        .map(|op| op["path"].as_str().unwrap().to_string())
+        .collect()
 }
 
 /// A stream query for the unheld session `session_id` in `CWD`: its subscription starts a

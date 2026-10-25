@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startRustTestServer, type RustTestServer } from "../../scripts/rust-test-server";
 import { projectPath, sessionPath } from "../../web/src/lib/session-route";
-import { controlsOf, opsOf, scopesOf, trackApi } from "./api-requests";
+import { controlsOf, nodeValue, opIdOf, opsOf, scopesOf, trackApi } from "./api-requests";
 import { collectBrowserErrors } from "./browser-errors";
 
 /** The PID of the current Agent process, as the fake Agent writes it at start. */
@@ -367,7 +367,7 @@ for (const { kind, listState } of [
 ] as const) {
   test(`restores a pending ${kind} after reload while session listing is ${listState}`, async ({ page }) => {
     const browserErrors = collectBrowserErrors(page, listState === "failed"
-      ? [{ status: 503, pathname: "/api/v2/scopes/catalog/ops" }]
+      ? [{ status: 503, pathname: "/api/v2/targets/catalog/ops" }]
       : []);
     await page.goto("/sessions/saved-session");
     const composer = page.locator('textarea[role="combobox"]');
@@ -378,7 +378,7 @@ for (const { kind, listState } of [
     let listRequests = 0;
     const listError = "Session listing failed during reload";
     // The catalog is listed by a `list` operation on `catalog` (protocol §6.2).
-    await page.route("**/api/v2/scopes/catalog/ops", async (route) => {
+    await page.route("**/api/v2/targets/catalog/ops", async (route) => {
       if (route.request().postDataJSON()?.kind !== "list") {
         await route.continue();
         return;
@@ -397,9 +397,8 @@ for (const { kind, listState } of [
     try {
       // The pages the catalog's document holds stay while its revision stays; a list is needed again
       // only after it changed, which another client creating a session does. Listing stalls from here on.
-      const global = await (await page.request.get("/api/v2/scopes/global")).json();
-      const other = await page.request.post("/api/v2/scopes/global/ops", {
-        data: { expect: global.snapshot.doc.live.op.id, kind: "create", args: { cwd: process.cwd() } },
+      const other = await page.request.post("/api/v2/targets/global/ops", {
+        data: { expect: await opIdOf(page.request, "global"), kind: "create", args: { cwd: process.cwd() } },
       });
       expect(other.status()).toBe(202);
 
@@ -774,7 +773,7 @@ test("pastes and drops negotiated ACP context into the Zed-style composer", asyn
   await expect(page.locator(".composer-document")).toContainText("context.md");
   await expect(page.locator(".composer-bar")).toContainText(/previous prompts/);
   const resend = page.waitForRequest((request) => request.method() === "POST" &&
-    new URL(request.url()).pathname === "/api/v2/scopes/session%2Fsaved-session/ops" && request.postDataJSON()?.kind === "prompt");
+    new URL(request.url()).pathname === "/api/v2/targets/sessions/saved-session/ops" && request.postDataJSON()?.kind === "prompt");
   await editor.press("Enter");
   // The resend names the session's attachments by reference (protocol §6.2).
   const resent = (await resend).postDataJSON().args;
@@ -798,10 +797,9 @@ test("edits and resends ordered prompt blocks without moving attachments", async
     { type: "text", text: "Second attachment:\n" + "Long source line 中文.\n".repeat(40), _meta: { source: "second" } },
     { type: "resource", resource: { uri: "attyd://attachment/note.txt", mimeType: 'text/plain; charset="utf-8"', text: "中文 context" } },
   ];
-  const scope = encodeURIComponent("session/saved-session");
-  const document = await (await page.request.get(`/api/v2/scopes/${scope}`)).json();
-  const accepted = await page.request.post(`/api/v2/scopes/${scope}/ops`, {
-    data: { expect: document.snapshot.doc.live.op.id, kind: "prompt", args: { prompt: blocks } },
+  const scope = "sessions/saved-session";
+  const accepted = await page.request.post(`/api/v2/targets/${scope}/ops`, {
+    data: { expect: await opIdOf(page.request, scope), kind: "prompt", args: { prompt: blocks } },
   });
   expect(accepted.status()).toBe(202);
   await expect(page.getByText("Received prompt blocks: text,image,text,resource.", { exact: true })).toBeVisible();
@@ -839,7 +837,7 @@ test("edits and resends ordered prompt blocks without moving attachments", async
   }
   await testInfo.attach("ordered-prompt-mobile", { body: await page.locator(".composer").screenshot(), contentType: "image/png" });
   const isPrompt = (request: import("@playwright/test").Request) => request.method() === "POST" &&
-    new URL(request.url()).pathname === `/api/v2/scopes/${scope}/ops` && request.postDataJSON()?.kind === "prompt";
+    new URL(request.url()).pathname === `/api/v2/targets/${scope}/ops` && request.postDataJSON()?.kind === "prompt";
   const submitted = page.waitForRequest(isPrompt);
   await fields.nth(1).press("Enter");
   // The entry keeps the prompt's blocks as it was sent, `_meta` included, with media as
@@ -916,7 +914,7 @@ test("opens attachment chips with native browser viewing and automatic downloads
   ]);
   await expect(page.locator(".attachment-list > span")).toHaveCount(6);
   const request = page.waitForRequest((request) => request.method() === "POST" &&
-    new URL(request.url()).pathname === "/api/v2/scopes/session%2Fsaved-session/ops" && request.postDataJSON()?.kind === "prompt");
+    new URL(request.url()).pathname === "/api/v2/targets/sessions/saved-session/ops" && request.postDataJSON()?.kind === "prompt");
   await editor.fill("attachment-input-flow");
   await editor.press("Enter");
   const sent = (await request).postDataJSON().args;
@@ -931,14 +929,13 @@ test("opens attachment chips with native browser viewing and automatic downloads
   await expect(content.locator("pre, img, audio, iframe, object, embed")).toHaveCount(0);
   await expect(content).not.toContainText("# 完整的中文附件");
   // The log names each attachment by reference; its content is not in the document.
-  const view = await (await page.request.get("/api/v2/scopes/session%2Fsaved-session")).json();
-  expect(JSON.stringify(view.snapshot.entries)).toContain('"type":"attachment"');
+  const view = await nodeValue(page.request, "/sessions/saved-session/entries");
+  expect(JSON.stringify(view)).toContain('"type":"attachment"');
   expect(JSON.stringify(view)).not.toContain("# 完整的中文附件");
   expect(JSON.stringify(view)).not.toContain(wave.toString("base64"));
   // The prompt's six attachments are `AttachmentRef`s in its user entry (§3.1).
   type Block = { type: string; text?: string };
-  const entries = (view.snapshot.entries.changed as Array<[number, { kind: string; role?: string; chunks?: Array<{ content: Block }> }]>)
-    .map(([, entry]) => entry);
+  const entries = view as Array<{ kind: string; role?: string; chunks?: Array<{ content: Block }> }>;
   const entry = entries.find(({ kind, role, chunks }) => kind === "message" && role === "user"
     && chunks?.some(({ content }) => content.type === "text" && content.text?.includes("attachment-input-flow")));
   expect(entry?.chunks?.filter(({ content }) => content.type === "attachment")).toHaveLength(6);
@@ -1474,7 +1471,7 @@ test("deletes an unopened session from its project without creating or opening a
     await expect(dialog).toContainText("Saved ACP session");
     const deleted = page.waitForResponse((response) =>
       response.request().method() === "POST" &&
-      new URL(response.url()).pathname === "/api/v2/scopes/global/ops" &&
+      new URL(response.url()).pathname === "/api/v2/targets/global/ops" &&
       response.request().postDataJSON()?.kind === "delete"
     );
     await dialog.getByRole("button", { name: "Delete session", exact: true }).click();
@@ -1577,9 +1574,8 @@ test("retires the open session after another client deletes it without subscribi
 
   // A separate API client deletes the session. This page gets no response of
   // its own: the stream's `end: deleted` must drive the exit.
-  const global = await (await page.request.get("/api/v2/scopes/global")).json();
-  const response = await page.request.post("/api/v2/scopes/global/ops", {
-    data: { expect: global.snapshot.doc.live.op.id, kind: "delete", args: { sessionId: "saved-session" } },
+  const response = await page.request.post("/api/v2/targets/global/ops", {
+    data: { expect: await opIdOf(page.request, "global"), kind: "delete", args: { sessionId: "saved-session" } },
   });
   expect(response.status()).toBe(202);
   await expect.poll(() => new URL(page.url()).pathname).toBe(projectPath(process.cwd()));
@@ -1593,7 +1589,7 @@ test("retires the open session after another client deletes it without subscribi
   });
   const listed = page.waitForResponse((candidate) =>
     candidate.request().method() === "POST" &&
-    new URL(candidate.url()).pathname === "/api/v2/scopes/catalog/ops" &&
+    new URL(candidate.url()).pathname === "/api/v2/targets/catalog/ops" &&
     candidate.request().postDataJSON()?.kind === "list" && candidate.status() === 202
   );
   await page.getByRole("button", { name: "Refresh projects and sessions", exact: true }).click();
@@ -1624,7 +1620,7 @@ test("keeps the user's later navigation when an earlier fork response arrives la
   const responseGate = new Promise<void>((resolve) => { releaseResponse = resolve; });
   let notifyForked!: (status: number) => void;
   const forkedOnAgent = new Promise<number>((resolve) => { notifyForked = resolve; });
-  await page.route("**/api/v2/scopes/session%2Fsaved-session/ops", async (route) => {
+  await page.route("**/api/v2/targets/sessions/saved-session/ops", async (route) => {
     if (route.request().postDataJSON()?.kind !== "fork") {
       await route.continue();
       return;
@@ -1648,7 +1644,7 @@ test("keeps the user's later navigation when an earlier fork response arrives la
     await composer.fill("Keep the later session's draft");
     const lateResponse = page.waitForResponse((response) =>
       response.request().method() === "POST" &&
-      new URL(response.url()).pathname === "/api/v2/scopes/session%2Fsaved-session/ops"
+      new URL(response.url()).pathname === "/api/v2/targets/sessions/saved-session/ops"
     );
     releaseResponse();
     await (await lateResponse).finished();
@@ -1685,7 +1681,7 @@ test("keeps the session and composer when deletion fails during close", async ({
     await page.getByRole("button", { name: "Delete thread", exact: true }).click();
     const deleted = page.waitForResponse((response) =>
       response.request().method() === "POST" &&
-      new URL(response.url()).pathname === "/api/v2/scopes/global/ops" &&
+      new URL(response.url()).pathname === "/api/v2/targets/global/ops" &&
       response.request().postDataJSON()?.kind === "delete"
     );
     await page.getByRole("alertdialog", { name: "Delete session?" })
@@ -1700,10 +1696,8 @@ test("keeps the session and composer when deletion fails during close", async ({
     await expect(page.getByText("Loaded history.", { exact: true })).toBeVisible();
     await expect(page.locator(".project-browser-path")).toHaveCount(0);
     // The close failed, so the session is still held, and this page still follows it.
-    const global = await (await page.request.get(`${origin}/api/v2/scopes/global`)).json();
-    expect(global.snapshot.doc.live.op).toMatchObject({ kind: "delete", status: "failed" });
-    const retained = await page.request.get(`${origin}/api/v2/scopes/${encodeURIComponent("session/saved-session")}`);
-    expect(retained.status()).toBe(200);
+    expect(await nodeValue(page.request, "/global/op", origin)).toMatchObject({ kind: "delete", status: "failed" });
+    expect(await nodeValue(page.request, "/sessions/saved-session/op", origin)).toBeDefined();
     expect(opsOf(api, "delete", "global")).toHaveLength(1);
     expect(api.v1).toEqual([]);
     expect(browserErrors).toEqual([]);
@@ -2901,7 +2895,7 @@ test("keeps the homepage selected when a previous create response arrives late",
   let notifyCreated!: () => void;
   const createdUpstream = new Promise<void>((resolve) => { notifyCreated = resolve; });
   // `create` is an operation on `global`; it is answered when admitted (§6.3), and what became of it is in the document.
-  await page.route("**/api/v2/scopes/global/ops", async (route) => {
+  await page.route("**/api/v2/targets/global/ops", async (route) => {
     if (route.request().postDataJSON()?.kind !== "create") {
       await route.continue();
       return;
@@ -2930,7 +2924,7 @@ test("keeps the homepage selected when a previous create response arrives late",
 
     const delivered = page.waitForResponse((response) =>
       response.request().method() === "POST" &&
-      new URL(response.url()).pathname === "/api/v2/scopes/global/ops" &&
+      new URL(response.url()).pathname === "/api/v2/targets/global/ops" &&
       response.request().postDataJSON()?.kind === "create"
     );
     releaseCreate();
@@ -2960,7 +2954,7 @@ test("serializes session list requests while startup and route refreshes overlap
   let inFlight = 0;
   let maximumInFlight = 0;
   // The catalog is listed by `list` operations on `catalog` (protocol §6.2).
-  await page.route("**/api/v2/scopes/catalog/ops", async (route) => {
+  await page.route("**/api/v2/targets/catalog/ops", async (route) => {
     if (route.request().postDataJSON()?.kind !== "list") {
       await route.continue();
       return;
@@ -3025,7 +3019,7 @@ for (const width of [1280, 390]) {
     await dialog.getByLabel("Project working directory", { exact: true }).fill(cwd);
     await page.screenshot({ path: test.info().outputPath("new-project-dialog.png") });
     const created = page.waitForRequest((request) =>
-      request.method() === "POST" && new URL(request.url()).pathname === "/api/v2/scopes/global/ops" &&
+      request.method() === "POST" && new URL(request.url()).pathname === "/api/v2/targets/global/ops" &&
       request.postDataJSON()?.kind === "create"
     );
     await dialog.getByRole("button", { name: "Create project", exact: true }).click();
@@ -3202,7 +3196,7 @@ test("leaves a running session without cancelling it and allows configuration on
   // Listing the catalog while its revision changes is refused `catalog_changed` (409, protocol §6.2); the
   // project browser lists again, and the browser logs the refusal. Whether the revision moves between two
   // pages depends on timing, so the refusal is expected here, and nothing else is.
-  const errors = collectBrowserErrors(page, [{ status: 409, pathname: "/api/v2/scopes/catalog/ops" }]);
+  const errors = collectBrowserErrors(page, [{ status: 409, pathname: "/api/v2/targets/catalog/ops" }]);
   const api = trackApi(page);
   let closeRequests = 0;
   page.on("request", (request) => {
@@ -3257,7 +3251,7 @@ test("creates a session in the selected project instead of the startup directory
   const dialog = page.getByRole("dialog", { name: "New thread" });
   await expect(dialog.getByLabel("Agent workspace", { exact: true })).toHaveValue(cwd);
   const created = page.waitForRequest((request) =>
-    request.method() === "POST" && new URL(request.url()).pathname === "/api/v2/scopes/global/ops" &&
+    request.method() === "POST" && new URL(request.url()).pathname === "/api/v2/targets/global/ops" &&
     request.postDataJSON()?.kind === "create"
   );
   await dialog.getByRole("button", { name: "Create thread" }).click();
@@ -3313,7 +3307,7 @@ test("reloads a created session URL even when the Agent list is empty", async ({
     await page.getByRole("button", { name: "New project", exact: true }).click();
     const refreshedList = page.waitForResponse((response) =>
       response.request().method() === "POST" &&
-      new URL(response.url()).pathname === "/api/v2/scopes/catalog/ops" &&
+      new URL(response.url()).pathname === "/api/v2/targets/catalog/ops" &&
       response.request().postDataJSON()?.kind === "list" &&
       response.status() === 202
     );
@@ -3711,7 +3705,7 @@ test("runs negotiated terminal authentication and reconnects the Agent", async (
   });
   // A catalog refresh can race the login's Agent restart. Only its explicit
   // stale refusal is allowed, and below it must recover using the newer op.
-  const catalogPath = "/api/v2/scopes/catalog/ops";
+  const catalogPath = "/api/v2/targets/catalog/ops";
   const browserErrors = collectBrowserErrors(page, [{ status: 409, pathname: catalogPath }]);
   const catalogResponses: Array<{
     method: string;
@@ -3733,7 +3727,7 @@ test("runs negotiated terminal authentication and reconnects the Agent", async (
   const firstInputGate = new Promise<void>((resolve) => { releaseFirstInput = resolve; });
   const inputChunks: string[] = [];
   // Terminal input is a resource action on the login terminal (protocol §7).
-  await page.route("**/api/v2/scopes/global/resources/*/input", async (route) => {
+  await page.route("**/api/v2/targets/global/resources/*/input", async (route) => {
     inputChunks.push(route.request().postDataJSON().data);
     if (inputChunks.length === 1) await firstInputGate;
     await route.continue();

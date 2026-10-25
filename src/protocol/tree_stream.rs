@@ -10,3 +10,5 @@ pub(crate) mod windowed_ops;
 pub(crate) mod wire;
 #[cfg(test)]
 pub(crate) mod client;
+#[cfg(test)]
+pub(crate) mod documents;

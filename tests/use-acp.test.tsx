@@ -1,15 +1,23 @@
 // @vitest-environment happy-dom
 
-// The revision 3 workspace, read side, against a fake stream: its connection lifecycle and
-// what the page shows of the documents (docs/protocol.md §3, §4). Snapshots carry valid
-// digests, because the replica engine installs nothing it cannot confirm.
+// The workspace, read side, against a fake stream: its connection lifecycle and what the page shows
+// of the documents (docs/protocol-r4-design.md §4). The cases write the documents of the scopes;
+// `TreeBridge` publishes each change as the event of the revision 4 tree a stream would carry, with
+// the hash the bridge would state, because the replica installs nothing it cannot confirm.
 import { act, StrictMode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { entryHash, scopeDigest, sessionDigest } from "../shared/digest";
-import type { StreamEvent } from "../shared/document-replica";
 import type { Entry, PromptState } from "../shared/entries";
+import type { Op } from "../shared/protocol";
+import { scopeOf } from "../shared/scope-feed";
 import { useAcp } from "../web/src/lib/use-acp";
+import { TreeBridge } from "./fixtures/tree-bridge";
+
+/** What the cases publish: a scope's document, a change to it with revision 3's ops, or its end. */
+type StreamEvent =
+  | { scope: string; snapshot: { epoch: string; rev: number; digest: string; doc: Record<string, unknown>; entries?: { changed: ReadonlyArray<readonly [number, unknown]> } } }
+  | { scope: string; rev: number; ops: Op[] }
+  | { scope: string; end: { reason: "deleted" | "closed" | "load_failed"; error?: Record<string, unknown> } };
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean })
   .IS_REACT_ACT_ENVIRONMENT = true;
@@ -26,10 +34,10 @@ class FakeEventSource {
     this.closed = true;
   }
   get scopes(): string[] {
-    return new URL(this.url, "http://test").searchParams.getAll("scope");
+    return new URL(this.url, "http://test").searchParams.getAll("follow").map((path) => scopeOf(path) ?? path);
   }
   get cwds(): string[] {
-    return new URL(this.url, "http://test").searchParams.getAll("cwd");
+    return new URL(this.url, "http://test").searchParams.getAll("cwd").map((cwd) => `session/${decodeURIComponent(cwd)}`);
   }
 }
 
@@ -51,8 +59,18 @@ async function settle(): Promise<void> {
   }
 }
 
+/** The fake bridge of the case: it holds the documents the cases publish. */
+let bridge: TreeBridge;
+
 async function emit(event: StreamEvent, source = current()): Promise<void> {
-  await act(async () => source.onmessage?.({ data: JSON.stringify(event) }));
+  const events = "snapshot" in event
+    ? [bridge.snapshot(event.scope, event.snapshot.doc, event.snapshot.entries?.changed.map(([, entry]) => entry))]
+    : "ops" in event
+      ? [bridge.ops(event.scope, event.ops)]
+      : event.end.reason === "load_failed" && event.end.error !== undefined && event.scope.startsWith("session/")
+        ? bridge.loadFailed(event.scope.slice("session/".length), event.end.error)
+        : [bridge.end(event.scope, event.end)];
+  for (const tree of events) await act(async () => source.onmessage?.({ data: JSON.stringify(tree) }));
   await settle();
 }
 
@@ -107,20 +125,15 @@ const held = {
   s1: { sessionId: "s1", cwd: "/w", title: "One", op: { kind: "open", status: "completed" }, pending: { interactions: 0, urlFlows: 0 } },
 };
 
-/** A snapshot of `scope` at `rev`, with the digest the bridge would send. */
+/** A snapshot of `scope`: its document. */
 function snapshot(scope: string, body: Record<string, unknown>, entries?: Entry[], rev = 0, epoch = "E1"): StreamEvent {
-  const digest = scope.startsWith("session/")
-    ? sessionDigest({ epoch, rev, ...body }, entries === undefined ? null : entries.map(entryHash))
-    : scopeDigest({ epoch, rev, ...body });
   return {
     scope,
     snapshot: {
-      epoch, rev, digest, doc: body,
-      ...(entries === undefined ? {} : {
-        entries: { base: "replace", length: entries.length, changed: entries.map((entry, index) => [index, entry] as const) },
-      }),
+      epoch, rev, digest: "", doc: body,
+      ...(entries === undefined ? {} : { entries: { changed: entries.map((entry, index) => [index, entry] as const) } }),
     },
-  } as StreamEvent;
+  };
 }
 
 const globalSnapshot = (live = globalLive()) => snapshot("global", { live });
@@ -146,12 +159,13 @@ function Probe() {
   return null;
 }
 
-describe("revision 3 workspace, read side", () => {
+describe("workspace, read side", () => {
   let container: HTMLDivElement;
   let root: Root;
 
   beforeEach(() => {
     FakeEventSource.sources = [];
+    bridge = new TreeBridge();
     posts = [];
     read = undefined;
     respond = (post) => ({ status: 202, body: { op: post.body.id } });
@@ -187,7 +201,7 @@ describe("revision 3 workspace, read side", () => {
     await settle();
   }
 
-  it("follows global and catalog on the revision 3 stream and shows the Agent", async () => {
+  it("follows global and catalog on the stream and shows the Agent", async () => {
     await mount("/");
     const source = current();
     expect(new URL(source.url, "http://test").pathname).toBe("/api/v2/stream");
@@ -207,7 +221,7 @@ describe("revision 3 workspace, read side", () => {
     expect(hook.state.phase).toBe("stopped");
     respond = () => ({ status: 204 });
     await act(async () => hook.reconnect());
-    expect(posts.map(({ url }) => url)).toEqual(["/api/v2/scopes/global/actions/restart"]);
+    expect(posts.map(({ url }) => url)).toEqual(["/api/v2/targets/global/actions/restart"]);
     expect(posts[0].body).toEqual({});
   });
 
@@ -437,7 +451,7 @@ describe("revision 3 workspace, read side", () => {
     await act(async () => hook.prompt([text("hi")]));
     await settle();
     expect(posts).toHaveLength(1);
-    expect(posts[0].url).toBe("/api/v2/scopes/session%2Fs1/ops");
+    expect(posts[0].url).toBe("/api/v2/targets/sessions/s1/ops");
     expect(posts[0].body).toMatchObject({ expect: "o1", kind: "prompt", args: { prompt: [text("hi")] } });
     expect(posts[0].body.id).toMatch(/^[A-Za-z0-9_-]{22}$/u);
     expect(hook.state.queue).toEqual([]);
@@ -539,7 +553,7 @@ describe("revision 3 workspace, read side", () => {
     await settle();
     expect(accepted).toBe(true);
     expect(posts).toHaveLength(1);
-    expect(posts[0].url).toBe("/api/v2/scopes/global/ops");
+    expect(posts[0].url).toBe("/api/v2/targets/global/ops");
     expect(posts[0].body).toMatchObject({ expect: "g0", kind: "create", args: { cwd: "/proj" } });
     expect(hook.state.sessionTransition).toEqual({ kind: "new", requestId: "transition:new" });
     const id = posts[0].body.id!;
@@ -633,14 +647,11 @@ describe("revision 3 workspace, read side", () => {
   });
 
   // #176: the replica may not have the commit that admitted the create yet; the bridge's
-  // document, read after the answer was lost, has it.
+  // log, asked after the answer was lost, has it.
   it("settles a create whose answer was lost from the bridge's document, not from a replica that lags", async () => {
     respond = () => LOST;
-    read = (url) => url === "/api/v2/scopes/global"
-      ? {
-        status: 200,
-        body: globalSnapshot(globalLive({ op: op("global", { id: posts[0].body.id, after: "g0", kind: "create", status: "running" }) })),
-      }
+    read = (url) => url.startsWith("/api/v2/targets/global/ops/")
+      ? { status: 200, body: { outcome: "admitted", record: { id: posts[0].body.id, after: "g0", kind: "create", status: "running" } } }
       : undefined;
     await mount("/");
     await emit(globalSnapshot());
@@ -657,7 +668,7 @@ describe("revision 3 workspace, read side", () => {
     await shownSession();
     await act(async () => hook.forkSession());
     await settle();
-    expect(posts[0].url).toBe("/api/v2/scopes/session%2Fs1/ops");
+    expect(posts[0].url).toBe("/api/v2/targets/sessions/s1/ops");
     expect(posts[0].body).toMatchObject({ expect: "o1", kind: "fork", args: {} });
     expect(hook.state.sessionTransition).toEqual({ kind: "fork", requestId: "transition:fork" });
     const id = posts[0].body.id!;
@@ -715,8 +726,8 @@ describe("revision 3 workspace, read side", () => {
     await act(async () => hook.resizeAuthTerminal("L", 100, 30));
     await settle();
     expect(posts.map((post) => [post.url, post.body])).toEqual([
-      ["/api/v2/scopes/global/resources/L/input", { data: "x" }],
-      ["/api/v2/scopes/global/resources/L/resize", { cols: 100, rows: 30 }],
+      ["/api/v2/targets/global/resources/L/input", { data: "x" }],
+      ["/api/v2/targets/global/resources/L/resize", { cols: 100, rows: 30 }],
     ]);
     respond = (post) => ({ status: 202, body: { op: post.body.expect } });
     await act(async () => hook.cancelAuthTerminal("L"));
@@ -725,7 +736,7 @@ describe("revision 3 workspace, read side", () => {
     respond = () => ({ status: 204 });
     await act(async () => hook.dismissAuthTerminal("L"));
     await settle();
-    expect(posts[3].url).toBe("/api/v2/scopes/global/resources/L/dismiss");
+    expect(posts[3].url).toBe("/api/v2/targets/global/resources/L/dismiss");
   });
 
   // -- interactions, controls and URL flows -------------------------------------------------
@@ -749,7 +760,7 @@ describe("revision 3 workspace, read side", () => {
     await act(async () => hook.respondPermission("A", allow));
     await settle();
     expect(posts.map((post) => [post.url, post.body])).toEqual([
-      ["/api/v2/scopes/session%2Fs1/resources/A/answer", { outcome: allow }],
+      ["/api/v2/targets/sessions/s1/resources/A/answer", { outcome: allow }],
     ]);
     // Sent, awaiting the document; B is untouched.
     const [a, b] = hook.state.permissions;
@@ -808,7 +819,7 @@ describe("revision 3 workspace, read side", () => {
     await act(async () => hook.respondElicitation("E", { action: "accept", content: {} }));
     await settle();
     expect(posts.map((post) => [post.url, post.body])).toEqual([
-      ["/api/v2/scopes/global/resources/E/answer", { response: { action: "accept", content: {} } }],
+      ["/api/v2/targets/global/resources/E/answer", { response: { action: "accept", content: {} } }],
     ]);
   });
 
@@ -824,8 +835,8 @@ describe("revision 3 workspace, read side", () => {
     await act(async () => hook.dismissExternalFlow("nope"));
     await settle();
     expect(posts.map((post) => post.url)).toEqual([
-      "/api/v2/scopes/session%2Fs1/resources/S/dismiss",
-      "/api/v2/scopes/global/resources/G/dismiss",
+      "/api/v2/targets/sessions/s1/resources/S/dismiss",
+      "/api/v2/targets/global/resources/G/dismiss",
     ]);
   });
 
@@ -836,7 +847,7 @@ describe("revision 3 workspace, read side", () => {
     await act(async () => hook.setMode("plan"));
     await settle();
     expect(posts.map((post) => [post.url, post.body])).toEqual([
-      ["/api/v2/scopes/session%2Fs1/actions/set_mode", { modeId: "plan" }],
+      ["/api/v2/targets/sessions/s1/actions/set_mode", { modeId: "plan" }],
     ]);
     expect(hook.state.pendingSessionControl).toMatchObject({ sessionId: "s1", kind: "mode" });
     expect(hook.state.running).toBe(true);
@@ -932,7 +943,7 @@ describe("revision 3 workspace, read side", () => {
     await emit(globalSnapshot(listable()));
     await emit(catalogSnapshot());
     expect(lists().map((post) => [post.url, post.body.expect, post.body.args])).toEqual([
-      ["/api/v2/scopes/catalog/ops", "c0", {}],
+      ["/api/v2/targets/catalog/ops", "c0", {}],
     ]);
     // Nothing is sent again against the same op, however often the page is told.
     await emit({ scope: "global", rev: 1, ops: [{ op: "set", path: "/live/agent/error", value: null }] } as StreamEvent);

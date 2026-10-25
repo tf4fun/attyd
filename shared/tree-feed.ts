@@ -1,16 +1,14 @@
-// The stream client of revision 3 (docs/protocol.md §5.1, §5.4). It follows a set
-// of scopes on one stream at a time and keeps their verified replicas; it reads
-// nothing over HTTP and holds no authoritative state (C1).
+// The stream client of revision 4 (docs/protocol-r4-design.md §6.1, §6.5). It follows a set of
+// paths on one stream at a time and keeps their verified replicas; it reads nothing over HTTP and
+// holds no authoritative state (C1).
 //
-// A new set closes the stream it replaces. A stream that breaks, an event that
-// does not apply and a replica that does not match the bridge's digest close the
-// stream too, and a new one subscribes after a delay that grows while nothing is
-// delivered, with the version held (or, when the content disagreed, without it,
-// so the bridge sends the whole document). The client says whether it is
-// synchronized or retrying.
+// A new set closes the stream it replaces. A stream that breaks, an event that does not apply and
+// a replica that does not match the bridge's hash close the stream too, and a new one subscribes
+// after a delay that grows while nothing is delivered, with the versions held (or, when the
+// content disagreed, without that path's, so the bridge sends the whole subtree). The client says
+// whether it is synchronized or retrying.
 
-import { DocumentReplicaSet, type DocumentReplica, type Follow, type StreamEvent } from "./document-replica";
-import type { End } from "./protocol";
+import { TreeReplicaSet, type Follow, type PathReplica, type TreeEnd, type TreeEvent } from "./tree-replica";
 
 /** One SSE connection, as `EventSource` offers it. */
 export interface StreamSource {
@@ -32,9 +30,9 @@ export type FeedStatus =
 const FIRST_DELAY_MS = 1000;
 const LAST_DELAY_MS = 30_000;
 
-export class FeedClient {
-  readonly #set = new DocumentReplicaSet("/api/v2/stream");
-  readonly #listeners = new Set<(scope: string) => void>();
+export class TreeFeedClient {
+  readonly #set = new TreeReplicaSet("/api/v2/stream");
+  readonly #listeners = new Set<(path: string) => void>();
   readonly #statusListeners = new Set<(status: FeedStatus) => void>();
   readonly #openStream: OpenStream;
   readonly #schedule: Schedule;
@@ -45,8 +43,6 @@ export class FeedClient {
   #closed = false;
   #failures = 0;
   #status: FeedStatus | undefined;
-  /** Why each scope that ended on the current set ended. */
-  readonly #ends = new Map<string, End>();
 
   constructor(
     openStream: OpenStream,
@@ -59,21 +55,25 @@ export class FeedClient {
   follow(follow: readonly Follow[]): void {
     if (this.#closed) return;
     this.#follow = follow;
-    this.#ends.clear();
     this.#connect();
   }
 
-  get(scope: string): DocumentReplica | undefined {
-    return this.#set.get(scope);
+  get(path: string): PathReplica | undefined {
+    return this.#set.get(path);
   }
 
-  /** Why `scope` ended, if it did since the set was followed. */
-  endOf(scope: string): End | undefined {
-    return this.#ends.get(scope);
+  /** The instance of the bridge the replicas belong to. */
+  get instance(): string | undefined {
+    return this.#set.instance;
   }
 
-  /** Calls `listener` with a scope each time its replica changes or ends. */
-  subscribe(listener: (scope: string) => void): () => void {
+  /** Why `path` ended, if it did since it was followed. */
+  endOf(path: string): TreeEnd | undefined {
+    return this.#set.endOf(path);
+  }
+
+  /** Calls `listener` with a path each time its replica changes or ends. */
+  subscribe(listener: (path: string) => void): () => void {
     this.#listeners.add(listener);
     return () => {
       this.#listeners.delete(listener);
@@ -119,37 +119,34 @@ export class FeedClient {
   }
 
   #receive(stream: number, data: string): void {
-    let scope: string;
-    let received: ReturnType<DocumentReplicaSet["receive"]>;
+    let received: ReturnType<TreeReplicaSet["receive"]>;
     try {
-      const event = JSON.parse(data) as StreamEvent;
-      scope = event.scope;
-      received = this.#set.receive(stream, event);
+      received = this.#set.receive(stream, JSON.parse(data) as TreeEvent);
     } catch {
       // Not an event of the protocol: the stream cannot be trusted further.
       this.#broken("the stream sent something that is not an event");
       return;
     }
-    if (received === "resubscribe") {
-      this.#broken(this.#set.lastResubscribe?.reason ?? "the replica could not be applied", scope);
-    } else if (received !== "ignored") {
-      if (received === "ended") this.#ends.set(scope, (JSON.parse(data) as { end: End }).end);
+    if (received.kind === "resubscribe") {
+      const { reason, path } = this.#set.lastResubscribe ?? { reason: "the replica could not be applied", path: undefined };
+      this.#broken(reason, path);
+    } else if (received.kind === "applied") {
       this.#failures = 0;
       this.#report({ state: "synchronized" });
-      this.#listeners.forEach((listener) => listener(scope));
+      for (const path of received.changed) this.#listeners.forEach((listener) => listener(path));
     }
   }
 
   /**
-   * The stream failed: close it, and subscribe again later (§5.4). A scope whose content
-   * keeps failing verification backs off by its own count, which another scope's
+   * The stream failed: close it, and subscribe again later (§6.5). A path whose content
+   * keeps failing verification backs off by its own count, which another path's
    * delivery does not reset.
    */
-  #broken(reason: string, scope?: string): void {
+  #broken(reason: string, path?: string): void {
     this.#disconnect();
     const generation = this.#generation;
     this.#failures += 1;
-    const attempt = Math.max(this.#failures, scope === undefined ? 0 : this.#set.consecutiveFailures(scope));
+    const attempt = Math.max(this.#failures, path === undefined ? 0 : this.#set.consecutiveFailures(path));
     const delayMs = Math.min(FIRST_DELAY_MS * 2 ** (attempt - 1), LAST_DELAY_MS);
     this.#report({ state: "retrying", attempt, delayMs, reason });
     this.#schedule(() => {

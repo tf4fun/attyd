@@ -1,0 +1,297 @@
+{
+ "comment": "The shape of the revision 4 tree (docs/protocol-r4-design.md \u00a74.2): the kind of each node by its path, `*` standing for one token, with the text rule of a value node and the child names of an object. The bridge's tree is checked against it (src/protocol/tree_doc) and so is the client's reading of it (shared/tree-shape.ts).",
+ "nodes": [
+  {
+   "path": "/global",
+   "kind": "object",
+   "children": [
+    "op",
+    "opDetail",
+    "ops",
+    "sessions",
+    "loadFailures",
+    "terminals",
+    "interactions",
+    "urlFlows"
+   ]
+  },
+  {
+   "path": "/global/op",
+   "kind": "value",
+   "rule": "none"
+  },
+  {
+   "path": "/global/opDetail",
+   "kind": "value",
+   "rule": "none"
+  },
+  {
+   "path": "/global/ops",
+   "kind": "list"
+  },
+  {
+   "path": "/global/ops/*",
+   "kind": "value",
+   "rule": "none"
+  },
+  {
+   "path": "/global/sessions",
+   "kind": "map"
+  },
+  {
+   "path": "/global/sessions/*",
+   "kind": "value",
+   "rule": "none"
+  },
+  {
+   "path": "/global/loadFailures",
+   "kind": "map"
+  },
+  {
+   "path": "/global/loadFailures/*",
+   "kind": "value",
+   "rule": "none"
+  },
+  {
+   "path": "/global/terminals",
+   "kind": "map"
+  },
+  {
+   "path": "/global/terminals/*",
+   "kind": "value",
+   "rule": "terminal"
+  },
+  {
+   "path": "/global/interactions",
+   "kind": "map"
+  },
+  {
+   "path": "/global/interactions/*",
+   "kind": "value",
+   "rule": "none"
+  },
+  {
+   "path": "/global/urlFlows",
+   "kind": "map"
+  },
+  {
+   "path": "/global/urlFlows/*",
+   "kind": "value",
+   "rule": "none"
+  },
+  {
+   "path": "/catalog",
+   "kind": "object",
+   "children": [
+    "op",
+    "opDetail",
+    "ops",
+    "interactions",
+    "urlFlows",
+    "pages"
+   ]
+  },
+  {
+   "path": "/catalog/op",
+   "kind": "value",
+   "rule": "none"
+  },
+  {
+   "path": "/catalog/opDetail",
+   "kind": "value",
+   "rule": "none"
+  },
+  {
+   "path": "/catalog/ops",
+   "kind": "list"
+  },
+  {
+   "path": "/catalog/ops/*",
+   "kind": "value",
+   "rule": "none"
+  },
+  {
+   "path": "/catalog/interactions",
+   "kind": "map"
+  },
+  {
+   "path": "/catalog/interactions/*",
+   "kind": "value",
+   "rule": "none"
+  },
+  {
+   "path": "/catalog/urlFlows",
+   "kind": "map"
+  },
+  {
+   "path": "/catalog/urlFlows/*",
+   "kind": "value",
+   "rule": "none"
+  },
+  {
+   "path": "/catalog/pages",
+   "kind": "list"
+  },
+  {
+   "path": "/catalog/pages/*",
+   "kind": "value",
+   "rule": "none"
+  },
+  {
+   "path": "/sessions",
+   "kind": "map"
+  },
+  {
+   "path": "/sessions/*",
+   "kind": "object",
+   "children": [
+    "controls",
+    "op",
+    "opDetail",
+    "ops",
+    "interactions",
+    "urlFlows",
+    "terminals",
+    "entries",
+    "prompts",
+    "turns"
+   ]
+  },
+  {
+   "path": "/sessions/*/controls",
+   "kind": "value",
+   "rule": "none"
+  },
+  {
+   "path": "/sessions/*/op",
+   "kind": "value",
+   "rule": "none"
+  },
+  {
+   "path": "/sessions/*/opDetail",
+   "kind": "value",
+   "rule": "none"
+  },
+  {
+   "path": "/sessions/*/ops",
+   "kind": "list"
+  },
+  {
+   "path": "/sessions/*/ops/*",
+   "kind": "value",
+   "rule": "none"
+  },
+  {
+   "path": "/sessions/*/interactions",
+   "kind": "map"
+  },
+  {
+   "path": "/sessions/*/interactions/*",
+   "kind": "value",
+   "rule": "none"
+  },
+  {
+   "path": "/sessions/*/urlFlows",
+   "kind": "map"
+  },
+  {
+   "path": "/sessions/*/urlFlows/*",
+   "kind": "value",
+   "rule": "none"
+  },
+  {
+   "path": "/sessions/*/terminals",
+   "kind": "map"
+  },
+  {
+   "path": "/sessions/*/terminals/*",
+   "kind": "value",
+   "rule": "terminal"
+  },
+  {
+   "path": "/sessions/*/entries",
+   "kind": "list"
+  },
+  {
+   "path": "/sessions/*/entries/*",
+   "kind": "value",
+   "rule": "entry"
+  },
+  {
+   "path": "/sessions/*/prompts",
+   "kind": "list"
+  },
+  {
+   "path": "/sessions/*/prompts/*",
+   "kind": "value",
+   "rule": "none"
+  },
+  {
+   "path": "/sessions/*/turns",
+   "kind": "list"
+  },
+  {
+   "path": "/sessions/*/turns/*",
+   "kind": "value",
+   "rule": "none"
+  },
+  {
+   "path": "/views",
+   "kind": "map"
+  },
+  {
+   "path": "/views/*",
+   "kind": "map"
+  },
+  {
+   "path": "/views/*/output",
+   "kind": "map"
+  },
+  {
+   "path": "/views/*/output/latest",
+   "kind": "value",
+   "rule": "outputView"
+  },
+  {
+   "path": "/views/*/history",
+   "kind": "map"
+  },
+  {
+   "path": "/views/*/history/*",
+   "kind": "map"
+  },
+  {
+   "path": "/views/*/history/*/*",
+   "kind": "map"
+  },
+  {
+   "path": "/views/*/history/*/*/output",
+   "kind": "map"
+  },
+  {
+   "path": "/views/*/history/*/*/output/*",
+   "kind": "value",
+   "rule": "outputView"
+  },
+  {
+   "path": "/views/*/history/*/*/turn",
+   "kind": "map"
+  },
+  {
+   "path": "/views/*/history/*/*/turn/*",
+   "kind": "object",
+   "children": [
+    "entries"
+   ]
+  },
+  {
+   "path": "/views/*/history/*/*/turn/*/entries",
+   "kind": "list"
+  },
+  {
+   "path": "/views/*/history/*/*/turn/*/entries/*",
+   "kind": "value",
+   "rule": "entry"
+  }
+ ]
+}

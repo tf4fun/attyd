@@ -1,8 +1,6 @@
 # Protocol revision 4: partial synchronization and serialized writes
 
-Status: **proposed design, fourth draft 2026-10-24, for review** (issue #201; reviews are
-tracked on PR #202, §15 lists what each review changed). Nothing here is implemented. Revision 3 ([protocol.md](protocol.md))
-stays the served protocol until this design is accepted and its plan (§14) lands.
+Status: **accepted and implemented** (issue #201, reviewed on PR #202, tracked and implemented in #203; §15 lists what each review changed). This document is the design record: requirements, the reasons revision 3 could not meet them, alternatives and decisions. The specification is [protocol.md](protocol.md). Revision 3 is at the fixed baseline linked in the [history index](history.md).
 Layer 1, the [bridge memory model](bridge-memory-model.md), is unchanged: this revision
 changes how that memory is published (layer 2), how clients write to it, and one
 holding rule (§7.2).
