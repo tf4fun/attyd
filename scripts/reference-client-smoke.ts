@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -49,15 +50,32 @@ try {
   const first = await stream.prompt("output-window-flow");
   assert.equal(first.status, 202, JSON.stringify(first.body));
   const turn = (first.body as { op: string }).op;
+  // The version at which the whole text was first held: the turn ends, and the view changes besides
+  // its text, after it, and neither makes the segments of that text stale.
+  const complete = await stream.until(() => (stream.output?.text.length === FLOW_BYTES ? stream.version : undefined), "the whole output");
   await stream.until(() => (stream.op?.id === turn && stream.op.status !== "running" ? true : undefined), "the turn to end");
   assert.equal(stream.op?.status, "completed");
-  await stream.until(() => (stream.output?.text.length === FLOW_BYTES ? true : undefined), "the whole output");
   // A checkpoint confirms what the device holds, hashed over the window from its 32-byte state.
   await stream.until(() => (stream.verified !== undefined && stream.verified === stream.version ? true : undefined), "a checkpoint");
   const held = stream.output!;
   assert.ok(held.text.text.endsWith("end of output"));
   assert.equal(held.text.offset + new TextEncoder().encode(held.text.text).length, FLOW_BYTES);
   assert.ok(held.text.text.length < bound, `the window holds ${held.text.text.length} characters`);
+
+  // Paging: from the version it held when the text was complete, the device reads the segments before
+  // its window one at a time, however many commits followed, and the chain reaches the window's
+  // 32-byte state (design §7.1).
+  let state = Buffer.alloc(32);
+  const textPath = `${stream.outputPath}/text`;
+  assert.ok(held.text.offset > 0 && held.text.offset % SEGMENT_LENGTH === 0, `the window starts at ${held.text.offset}`);
+  for (let index = 0; index < held.text.offset / SEGMENT_LENGTH; index++) {
+    const response = await fetch(`${origin}/api/v2/nodes${textPath}/segments/${index}?at=${complete}`);
+    assert.equal(response.status, 200, `segment ${index}: ${await response.clone().text()}`);
+    const read = await response.json() as { before: string; segment: string };
+    assert.equal(read.before, state.toString("base64url"), `the chain before segment ${index}`);
+    state = createHash("sha256").update(state).update(read.segment, "utf8").digest();
+  }
+  assert.equal(state.toString("base64url"), held.text.before, "the chain reaches the state the window starts from");
 
   // The figures: no event carries a window's text of N + L bytes, nothing is held beyond it, and
   // applying an event needs under 2 (N + L) bytes of text, however long the output is.
