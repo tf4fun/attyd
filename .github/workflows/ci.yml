@@ -125,6 +125,9 @@ jobs:
       - name: Test ACP protocol integration
         if: ${{ !(github.event_name == 'pull_request' && github.event.pull_request.draft) }}
         run: node --import tsx scripts/acp-protocol-smoke.ts
+      - name: Test the reference client of the tree protocol
+        if: ${{ !(github.event_name == 'pull_request' && github.event.pull_request.draft) }}
+        run: node --import tsx scripts/reference-client-smoke.ts
       - name: Check development build without embedded frontend
         if: ${{ !(github.event_name == 'pull_request' && github.event.pull_request.draft) }}
         run: cargo check --locked --features dev

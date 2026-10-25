@@ -52,6 +52,10 @@ try {
     ...instrumentedEnvironment,
     ATTYD_RUST_BINARY: rustBinary,
   });
+  run("node", ["--import", "tsx", "scripts/reference-client-smoke.ts"], {
+    ...instrumentedEnvironment,
+    ATTYD_RUST_BINARY: rustBinary,
+  });
   // Invoke Playwright directly: test:browser would rebuild an uninstrumented host.
   // Every fixture inherits both the binary override and LLVM_PROFILE_FILE.
   run("node", ["node_modules/@playwright/test/cli.js", "test"], {
