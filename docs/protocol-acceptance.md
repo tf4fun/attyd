@@ -263,8 +263,29 @@ r2 are new or changed in revision 2; their runtime code is not migrated yet.
    - An answer's success arriving before the stream shows the change, and an
      operation B replaced by C before a slow subscriber sees B, both leave the replica
      correct and the client waiting on nothing.
-   - `create` and `fork` deliver the new session ID in their response even when `op`
-     was already replaced.
+   - In revision 4, `202` confirms admission. `create` and `fork` find the new session
+     through the current operation's result or the held session's `origin`; retained
+     operation records settle failures and cancellations after the head was replaced.
+
+   Creation-result waiting (#224, P2-6) is exercised through the browser's production
+   `Workspace` in [use-acp.test.tsx](../tests/use-acp.test.tsx). The fixture provides
+   explicit bounded records with their admission revisions; it does not implement a
+   second operation-log reducer. An accepted request whose result is no longer
+   available ends the UI transition with an explicit message, retaining the fact of
+   admission and never issuing a new request automatically.
+
+   | Boundary | Gate |
+   | --- | --- |
+   | A failed create or fork missed across two later operations settles from its issuing target's log and allows another user action | `settles an accepted ${kind} failure from its target log after two later operations` |
+   | A lost HTTP answer can settle a definite failure from the outcome GET before the stream catches up | `settles a lost ${kind} response from an admitted terminal record while its stream still lags` |
+   | A completed GET has only an admission revision and no target result; both an old-expect stream and a running stream wait for the terminal cut and origin before navigating | `waits for the stream's origin when a completed ${kind} GET arrives before its stream result` |
+   | Retained cancellation or completion without an available origin ends waiting without a duplicate request | `settles a retained ${status} ${kind} without a held origin or a duplicate request` |
+   | Expired records, released sessions and restarted instances preserve known acceptance, report an unavailable result and send no new ID | The `keeps an accepted request accepted` cases, plus `keeps admission learned after a lost response when the fork source is later released` |
+   | A late origin still locates a completed fork, and an old navigation's HTTP callback cannot clear a newer transition | `finds a completed fork by origin after its source operation was replaced twice` and `does not let a late create response from a previous navigation clear a newer transition` |
+
+   [scope-feed.test.ts](../tests/scope-feed.test.ts) verifies complete immutable records
+   reach the UI adapter; [write-client.test.ts](../tests/write-client.test.ts) verifies
+   the issuing target and outcome GET retain status/error details and the original write.
 
 <a id="a10"></a>
 

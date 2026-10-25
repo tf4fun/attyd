@@ -33,20 +33,22 @@ export function treeValue(scope: string, doc: Doc): Doc {
   const live = (isRecord(doc.live) ? doc.live : {}) as Doc;
   const { op, ...rest } = live;
   const { head, detail } = split((op ?? {}) as Doc);
-  const common = { op: head, opDetail: detail, ops: [] as unknown[] };
+  // A case supplies its operation log explicitly; this fixture does not maintain one.
+  const common = { op: head, opDetail: detail, ops: doc.ops ?? [] };
   if (scope.startsWith("session/")) {
+    const historyRev = typeof doc.historyRev === "number" ? doc.historyRev : 1;
     return {
       ...rest,
       ...common,
-      historyRev: 1,
-      heldSince: 1,
+      historyRev,
+      heldSince: doc.heldSince ?? 1,
       ...(doc.history === undefined ? {} : { history: doc.history }),
       ...(doc.entries === undefined ? {} : { entries: doc.entries }),
       prompts: doc.prompts ?? [],
       // The partition the bridge publishes with the entries.
       ...(doc.entries === undefined
         ? {}
-        : { turns: turnHeads(doc.entries as Entry[], (doc.prompts ?? []) as PromptState[]) }),
+        : { turns: turnHeads(doc.entries as Entry[], (doc.prompts ?? []) as PromptState[], historyRev) }),
     };
   }
   return { ...rest, ...common, ...(scope === "global" ? { loadFailures: doc.loadFailures ?? {} } : {}) };

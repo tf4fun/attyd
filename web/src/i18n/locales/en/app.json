@@ -78,6 +78,9 @@
     "contextNotReady": "Wait for an active ACP session before adding workspace context",
     "promptNotReady": "The ACP session is not ready to accept this prompt",
     "uncertainWrite": "The {{operation}} request may have taken effect; its response was lost and it is not sent again.",
+    "acceptedResultUnknown": "The {{operation}} request was accepted, but its result is currently unavailable. It is not sent again.",
+    "operationFailed": "The {{operation}} operation failed.",
+    "operationCancelled": "The {{operation}} operation was cancelled.",
     "refused": "The {{operation}} request was refused: {{message}}"
   },
   "interfaceSettings": {

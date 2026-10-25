@@ -78,6 +78,9 @@
     "contextNotReady": "请等待 ACP 会话就绪后再添加工作区上下文",
     "promptNotReady": "ACP 会话尚未就绪，暂时无法接收此消息",
     "uncertainWrite": "{{operation}} 请求可能已生效；响应丢失，不会再次发送。",
+    "acceptedResultUnknown": "{{operation}} 请求已被接受，但目前无法取得结果，不会再次发送。",
+    "operationFailed": "{{operation}} 操作失败。",
+    "operationCancelled": "{{operation}} 操作已取消。",
     "refused": "{{operation}} 请求被拒绝：{{message}}"
   },
   "interfaceSettings": {
