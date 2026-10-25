@@ -48,7 +48,6 @@ impl Drop for AuthTerminalCleanup<'_> {
 struct ActiveAuthTerminal {
     request_id: String,
     master: Mutex<Box<dyn MasterPty + Send>>,
-    writer: TerminalWriter,
     /// The input queue of the terminal's own blocking writer.
     input: std::sync::mpsc::Sender<QueuedInput>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
@@ -113,7 +112,6 @@ impl AuthTerminalManager {
         let active = Arc::new(ActiveAuthTerminal {
             request_id,
             master: Mutex::new(pair.master),
-            writer: writer.clone(),
             input,
             killer: Mutex::new(child.clone_killer()),
             cancelled: AtomicBool::new(false),
@@ -127,15 +125,6 @@ impl AuthTerminalManager {
         spawn_writer(writer, queued);
         self.spawn_waiter(active, child, reader_done);
         Ok(())
-    }
-
-    pub fn write(&self, request_id: &str, data: &str) -> Result<(), Error> {
-        let active = self.require_active(request_id)?;
-        let mut writer = active.writer.lock().map_err(lock_error)?;
-        writer
-            .write_all(data.as_bytes())
-            .map_err(Error::into_internal_error)?;
-        writer.flush().map_err(Error::into_internal_error)
     }
 
     /// Queues `data` for the login's stdin behind the input queued before it.
@@ -488,13 +477,13 @@ mod tests {
 
         output_until(&mut observed, "base-arg|terminal-arg:method-env>").await;
         manager.resize("auth", 100, 30).unwrap();
-        manager.write("auth", "ok\n").unwrap();
+        manager.queue_input("auth", "ok\n".into()).unwrap().await.unwrap().unwrap();
         assert_eq!(exited(&mut observed).await, (Some(0), None, false, None));
         assert_eq!(
             next_signal(&mut signals).await,
             BridgeEvent::TerminalLoginSucceeded
         );
-        assert!(manager.write("auth", "late").is_err());
+        assert!(manager.queue_input("auth", "late".into()).is_err());
     }
 
     #[cfg(unix)]
@@ -525,7 +514,7 @@ mod tests {
         manager.cancel("cancel-auth").unwrap();
         let (_, _, cancelled, _) = exited(&mut observed).await;
         assert!(cancelled);
-        assert!(manager.write("cancel-auth", "late").is_err());
+        assert!(manager.queue_input("cancel-auth", "late".into()).is_err());
         settled(&mut observed).await;
         assert!(
             signals.try_recv().is_err(),
@@ -612,7 +601,7 @@ mod tests {
             );
             let (_, _, cancelled, _) = exited(&mut observed).await;
             assert!(cancelled);
-            assert!(manager.write("unwind-auth", "late").is_err());
+            assert!(manager.queue_input("unwind-auth", "late".into()).is_err());
         });
         drop(runtime);
     }
