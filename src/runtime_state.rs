@@ -1364,41 +1364,6 @@ impl SessionRegistry {
         Ok(())
     }
 
-    #[cfg(test)]
-    pub(crate) fn complete_control_operation(
-        &mut self,
-        expected_epoch: &str,
-        session_id: &str,
-        operation_id: &str,
-        kind: SessionOperationKind,
-        control_update: Value,
-    ) -> Result<(), RuntimeStateError> {
-        self.require_epoch(expected_epoch)?;
-        if !matches!(
-            kind,
-            SessionOperationKind::SetMode | SessionOperationKind::SetConfig
-        ) {
-            return Err(RuntimeStateError::OperationMismatch);
-        }
-        let owner = self.live_owner_mut(session_id)?;
-        if owner.operation.as_ref().is_none_or(|operation| {
-            operation.operation_id != operation_id || operation.kind != kind
-        }) {
-            return Err(RuntimeStateError::OperationMismatch);
-        }
-        owner.operation = None;
-        // The acknowledgement folds after every earlier notification (§4.5).
-        owner
-            .live
-            .as_mut()
-            .expect("live owner checked")
-            .controls
-            .fold_update(&control_update);
-        self.complete_session_operation(session_id, kind, &Value::Null);
-
-        Ok(())
-    }
-
     pub(crate) fn fail_operation(
         &mut self,
         expected_epoch: &str,
@@ -4422,46 +4387,6 @@ mod tests {
                 Err(RuntimeStateError::OperationMismatch),
             );
         }
-    }
-
-    #[test]
-    fn control_success_updates_value_and_retires_result_payload_atomically() {
-        let mut state = state();
-        open(&mut state, "session");
-        state
-            .start_operation(
-                "epoch",
-                "session",
-                "mode",
-                SessionOperationKind::SetMode,
-                "setting",
-            )
-            .unwrap();
-        let before = state.live_snapshot();
-
-        state
-            .complete_control_operation(
-                "epoch",
-                "session",
-                "mode",
-                SessionOperationKind::SetMode,
-                json!({ "sessionUpdate": "current_mode_update", "currentModeId": "plan" }),
-            )
-            .unwrap();
-
-        assert_ne!(state.live_snapshot(), before);
-        let session = state.session("session").unwrap();
-        assert!(session.operation.is_none());
-        assert_eq!(
-            session.controls.modes.as_ref().unwrap().current_mode_id,
-            "plan",
-        );
-        assert!(!state.operation_in_use("mode"));
-        assert!(
-            !serde_json::to_string(&state.live_snapshot())
-                .unwrap()
-                .contains("\"ok\":true")
-        );
     }
 
     #[test]
