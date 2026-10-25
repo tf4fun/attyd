@@ -39,6 +39,12 @@ runs the frontend, Rust backend, and Chromium browser suites as independent para
 unit, remote-transport, protocol v2 host-smoke, release-build, and standalone-binary checks remain
 separate steps so failures identify their layer directly. See the workflow for CI gates.
 
+`npm run typecheck`, also run by `npm run check`, checks the web/shared code, TypeScript
+scripts and Agent fixtures, Playwright browser tests, and ordinary unit tests matching
+`tests/**/*.test.ts` and `tests/**/*.test.tsx`. The unit-test configuration inherits
+the application's strict checks. Passing Vitest execution does not replace this
+static type check.
+
 **Draft pull requests run the fast checks only**: release metadata, the npm and Rust dependency
 audits, TypeScript, the frontend tests, and the Rust tests (`npm run test:rust`). Marking the pull
 request ready for review runs the whole validation, and so does every later push to it: the
