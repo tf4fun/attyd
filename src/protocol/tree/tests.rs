@@ -444,25 +444,30 @@ fn text_entry(text: &str) -> BTreeMap<String, Spec> {
     )])
 }
 
+const TEXT: &str = "/chunks/0/content/text";
+
+fn position(tree: &Tree) -> PositionHistory {
+    tree.get("/e").unwrap().text_history().positions[TEXT]
+}
+
 #[test]
 fn appends_to_a_text_do_not_replace_it_and_anything_else_does() {
     let mut tree = Tree::new("i");
     tree.commit(text_entry("ab"));
-    assert_eq!(tree.get("/e").unwrap().text_history().replaced, 1, "a new value is a new text");
+    assert_eq!(position(&tree), PositionHistory { replaced: 1, floor: 2 }, "a new value is a new text");
     tree.commit(text_entry("abc"));
     tree.commit(text_entry("abcdef"));
-    let history = tree.get("/e").unwrap().text_history();
-    assert_eq!(history.replaced, 1);
-    let lengths: Vec<u64> = history.lengths.iter().map(|(_, held)| held[0].1).collect();
+    assert_eq!(position(&tree), PositionHistory { replaced: 1, floor: 2 });
+    let lengths: Vec<u64> = tree.get("/e").unwrap().text_history().lengths.iter().map(|(_, held)| held[0].1).collect();
     assert_eq!(lengths, [2, 3, 6]);
     tree.commit(text_entry("xbcdefg"));
-    assert_eq!(tree.get("/e").unwrap().text_history().replaced, 4, "an edit is a replacement");
+    assert_eq!(position(&tree), PositionHistory { replaced: 4, floor: 7 }, "an edit is a replacement");
     tree.commit(text_entry("xbcdef"));
-    assert_eq!(tree.get("/e").unwrap().text_history().replaced, 5, "so is a shortening");
+    assert_eq!(position(&tree), PositionHistory { replaced: 5, floor: 6 }, "so is a shortening");
 }
 
 #[test]
-fn a_value_that_changes_besides_its_text_replaces_it() {
+fn a_value_that_changes_besides_its_text_does_not_replace_the_text() {
     let mut tree = Tree::new("i");
     tree.commit(text_entry("ab"));
     let mut next = text_entry("abc");
@@ -471,7 +476,7 @@ fn a_value_that_changes_besides_its_text_replaces_it() {
             { "content": { "type": "text", "text": "abc" } }] }));
     }
     tree.commit(next);
-    assert_eq!(tree.get("/e").unwrap().text_history().replaced, 2);
+    assert_eq!(position(&tree), PositionHistory { replaced: 1, floor: 2 }, "the text only grew");
 }
 
 #[test]

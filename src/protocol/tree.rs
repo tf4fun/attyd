@@ -85,16 +85,26 @@ enum Body {
     List(Vec<Node>),
 }
 
-/// How the text positions of a value node have changed, to tell a segment read whether the
-/// segment it names is the one a client holds (design §7.1): earlier segments of a text never
-/// change while it only grows, and the lengths tell which segments were complete.
+/// How one text position of a value node has changed, to tell a segment read whether the segment
+/// it names is the one a client holds (design §7.1): earlier segments of a text never change while
+/// it only grows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PositionHistory {
+    /// The revision at which the position was last replaced or edited other than by an append (a
+    /// position new to the node counts as replaced).
+    pub replaced: u64,
+    /// The length in bytes the position had then. It only grew since, so every segment that ends
+    /// within it is complete at any revision from `replaced` on.
+    pub floor: u64,
+}
+
+/// How the text positions of a value node have changed.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TextHistory {
-    /// The revision at which a text position was last replaced or edited other than by an
-    /// append.
-    pub replaced: u64,
+    /// By pointer into the value.
+    pub positions: BTreeMap<String, PositionHistory>,
     /// The length in bytes of each text position, by pointer, as of the last revisions at which
-    /// the value changed.
+    /// the value changed: for a segment that ends beyond `floor` of a position.
     pub lengths: VecDeque<(u64, Vec<(String, u64)>)>,
 }
 
@@ -323,13 +333,12 @@ impl Node {
                     Body::Value(old.clone(), rule)
                 }
                 Some(Body::Value(old, _)) => {
-                    let before = ops.len();
                     diff::diff(path, old, &value, &text_mode, ops);
-                    text = Node::text_after(old_text, rule, &value, path, &ops[before..], rev);
+                    text = Node::text_after(old_text, Some(old), rule, &value, rev);
                     Body::Value(value, rule)
                 }
                 _ => {
-                    text = Node::text_after(None, rule, &value, path, &[], rev);
+                    text = Node::text_after(None, None, rule, &value, rev);
                     Body::Value(value, rule)
                 }
             },
@@ -408,38 +417,38 @@ impl Node {
         Node { rev: own, srev, body, hash, text }
     }
 
-    /// The text history of a value node that has just taken `value`: whether the ops that made
-    /// it were only appends to its text positions, and the lengths now.
+    /// The text history of a value node that has just taken `value` from `before`: per text
+    /// position, whether it only grew (its text still starts with the old one) or was replaced,
+    /// and the lengths now.
     fn text_after(
         old: Option<&TextHistory>,
+        before: Option<&Value>,
         rule: TextRule,
         value: &Value,
-        path: &str,
-        ops: &[Op],
         rev: u64,
     ) -> TextHistory {
-        let positions = hash::text_pointers(rule, value);
-        if positions.is_empty() {
+        let pointers = hash::text_pointers(rule, value);
+        if pointers.is_empty() {
             return TextHistory::default();
         }
-        let only_appends = !ops.is_empty()
-            && ops.iter().all(|op| match op {
-                Op::Append { path: at, tail: AppendTail::Text { .. } } => at
-                    .strip_prefix(path)
-                    .is_some_and(|pointer| positions.iter().any(|position| position == pointer)),
-                _ => false,
-            });
-        let mut history = old.cloned().unwrap_or_default();
-        if !only_appends || old.is_none() {
-            history.replaced = rev;
+        let mut history = TextHistory {
+            positions: BTreeMap::new(),
+            lengths: old.map(|old| old.lengths.clone()).unwrap_or_default(),
+        };
+        let mut lengths = Vec::with_capacity(pointers.len());
+        for pointer in pointers {
+            let now = value.pointer(&pointer).and_then(Value::as_str).unwrap_or("");
+            let grew = before
+                .and_then(|before| before.pointer(&pointer))
+                .and_then(Value::as_str)
+                .is_some_and(|was| now.starts_with(was));
+            let kept = old.and_then(|old| old.positions.get(&pointer)).filter(|_| grew);
+            history.positions.insert(
+                pointer.clone(),
+                kept.copied().unwrap_or(PositionHistory { replaced: rev, floor: now.len() as u64 }),
+            );
+            lengths.push((pointer, now.len() as u64));
         }
-        let lengths = positions
-            .iter()
-            .map(|position| {
-                let length = value.pointer(position).and_then(Value::as_str).map_or(0, str::len);
-                (position.clone(), length as u64)
-            })
-            .collect();
         history.lengths.push_back((rev, lengths));
         while history.lengths.len() > LENGTH_HISTORY {
             history.lengths.pop_front();
