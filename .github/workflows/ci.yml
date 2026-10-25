@@ -55,7 +55,7 @@ jobs:
         with:
           tool: cargo-audit@0.22.2
       - name: Audit Rust dependencies
-        run: cargo audit --file Cargo.lock
+        run: cargo audit --file Cargo.lock --deny unsound
 
   frontend:
     runs-on: ubuntu-26.04
