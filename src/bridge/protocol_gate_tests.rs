@@ -2,8 +2,8 @@
 //! transport (docs/state-sync.md §4.1).
 //!
 //! A scripted Agent drives `run_connection` over an in-memory transport. The feed's tap hands
-//! every commit to the test with the documents it published; one replica per scope applies each
-//! event at the wire level and is compared with the published document after every event.
+//! every commit to the test with the nodes it published; an R4 client applies each atomic event
+//! and is compared with all published nodes after every commit.
 //! Operations start through the bridge's admission of writes (protocol §6); a test that only
 //! needs an occupied scope installs one through the registry's internal entry point.
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -17,11 +17,13 @@ use futures::{SinkExt, StreamExt};
 use super::*;
 use crate::protocol::admission::OpWrite;
 use crate::protocol::documents::{OperationKind, ProtocolError, Scope};
-use crate::protocol::feed::FeedSubscription;
+use crate::protocol::feed::TreeSubscription;
 use crate::protocol::feed::tap::TapCommit;
-use crate::protocol::subscription::Subscribed;
 use crate::protocol::publication::Publication;
-use crate::protocol::replica::Replica;
+use crate::protocol::tree_stream::client::Client;
+use crate::protocol::tree_stream::documents::{Document, document, path_of};
+use crate::protocol::tree_stream::params::{Follow, StreamQuery};
+use crate::protocol::tree_stream::wire::{Change, Event};
 use crate::protocol::op::OpEnd;
 use crate::protocol::outcome::{self, Request as OutcomeRequest};
 
@@ -37,7 +39,7 @@ struct Step {
 }
 
 impl Step {
-    fn of(replica: &Replica) -> Self {
+    fn of(replica: &Document) -> Self {
         Self {
             doc: replica.doc.clone(),
             ended_prompts: replica.ended_prompts(),
@@ -49,110 +51,91 @@ impl Step {
     }
 }
 
-/// The replicas of every scope, fed one commit at a time.
-#[derive(Debug, Default)]
+/// The real R4 client follows three roots. Scope documents are only assertion views of its
+/// nodes; they never receive or apply events themselves.
+#[derive(Debug)]
 struct Gate {
-    replicas: BTreeMap<String, Replica>,
-    /// Every commit's events, in order.
-    history: Vec<Vec<Value>>,
-    /// Every scope's documents, from the cut on, after each of its events.
+    client: Client,
+    replicas: BTreeMap<String, Document>,
+    history: Vec<Vec<Event>>,
     timeline: BTreeMap<String, Vec<Step>>,
-    /// Scopes the bridge stopped publishing without an `end` (a release, S6). Their replicas
-    /// stay, as a client keeps its copy.
     released: BTreeSet<String>,
 }
 
 impl Gate {
-    /// Replicas aligned with a cut of the published documents.
-    fn new(cut: &Documents) -> Self {
-        let mut gate = Self::default();
-        for (scope, document) in cut {
-            let replica = Replica::from_snapshot(document);
-            gate.timeline
-                .insert(scope.clone(), vec![Step::of(&replica)]);
-            gate.replicas.insert(scope.clone(), replica);
-        }
+    fn new(cut: &TapCommit) -> Self {
+        let mut gate = Self {
+            client: Client::following(&["/global", "/catalog", "/sessions"]),
+            replicas: BTreeMap::new(),
+            history: Vec::new(),
+            timeline: BTreeMap::new(),
+            released: BTreeSet::new(),
+        };
+        gate.apply(cut.events.clone(), &cut.documents);
+        assert!(gate.client.instance.is_some(), "the initial cut names its tree instance");
+        gate.history.clear();
         gate
     }
 
-    /// Applies one commit's events, one at a time, checking each scope's replica against the
-    /// document the commit published. Then every published scope is checked, so a change
-    /// without its event is caught.
-    fn apply(&mut self, events: Vec<Value>, documents: &Documents) {
-        let mut seen = BTreeSet::new();
-        for event in &events {
-            let scope = event["scope"].as_str().unwrap().to_string();
-            assert!(
-                seen.insert(scope.clone()),
-                "two events for {scope} in one commit: {events:?}"
-            );
-            if event.get("end").is_some() {
-                assert!(
-                    self.replicas.remove(&scope).is_some(),
-                    "{scope} ended without a replica"
-                );
-                assert!(
-                    !documents.contains_key(&scope),
-                    "{scope} ended but is still published"
-                );
-                self.released.remove(&scope);
-                continue;
+    fn nodes(&self) -> Documents {
+        let mut nodes = BTreeMap::new();
+        for scope in ["global", "catalog"] {
+            if let Some(value) = self.client.value(&path_of(scope)) {
+                nodes.insert(scope.to_string(), value.clone());
             }
-            self.released.remove(&scope);
-            let replica = self.replicas.entry(scope.clone()).or_default();
-            replica
-                .apply(event)
-                .unwrap_or_else(|error| panic!("{error}"));
-            let document = documents
-                .get(&scope)
-                .unwrap_or_else(|| panic!("{scope} changed but is not published"));
-            let expected = Replica::from_snapshot(document);
-            assert_eq!(replica.doc, expected.doc, "{scope} after {event}");
-            assert_eq!(
-                (&replica.epoch, replica.rev),
-                (&expected.epoch, expected.rev),
-                "the version of {scope} after {event}"
-            );
-            self.timeline
-                .entry(scope)
-                .or_default()
-                .push(Step::of(replica));
+        }
+        if let Some(sessions) = self.client.value("/sessions").and_then(Value::as_object) {
+            nodes.extend(sessions.iter().map(|(id, value)| (format!("session/{id}"), value.clone())));
+        }
+        nodes
+    }
+
+    /// Apply the wire event atomically, then compare every published node with the cut. A
+    /// lost event or a change not published as an event cannot be hidden by the assertion view.
+    fn apply(&mut self, events: Vec<Event>, documents: &Documents) {
+        let mut changed = BTreeSet::new();
+        for event in &events {
+            for change in event.changes.iter().flatten() {
+                assert!(changed.insert(change.path().to_string()), "two changes of {} in one commit: {events:?}", change.path());
+            }
+            self.client.apply(event).unwrap_or_else(|error| panic!("{error}: {event:?}"));
+            let nodes = self.nodes();
+            for scope in self.replicas.keys() {
+                if !nodes.contains_key(scope) {
+                    self.released.insert(scope.clone());
+                }
+            }
+            let mut replicas = BTreeMap::new();
+            for (scope, value) in nodes {
+                let path = if scope.starts_with("session/") { "/sessions".into() } else { path_of(&scope) };
+                let replica = Document {
+                    doc: document(&scope, &value).expect("a scope node has its operation"),
+                    rev: self.client.version(&path),
+                };
+                if self.replicas.get(&scope).is_none_or(|previous| previous.doc != replica.doc) {
+                    self.timeline.entry(scope.clone()).or_default().push(Step::of(&replica));
+                }
+                self.released.remove(&scope);
+                replicas.insert(scope, replica);
+            }
+            self.replicas = replicas;
         }
         self.history.push(events);
         self.check(documents);
     }
 
-    /// Every published scope's replica equals its document; a replica whose scope is no longer
-    /// published was released.
     fn check(&mut self, documents: &Documents) {
-        for (scope, document) in documents {
-            let replica = self
-                .replicas
-                .get(scope)
-                .unwrap_or_else(|| panic!("{scope} is published but never reached the replica"));
-            let expected = Replica::from_snapshot(document);
-            assert_eq!(replica.doc, expected.doc, "{scope}");
-            assert_eq!(
-                (&replica.epoch, replica.rev),
-                (&expected.epoch, expected.rev),
-                "the version of {scope}"
-            );
+        let nodes = self.nodes();
+        for (scope, value) in documents {
+            assert_eq!(nodes.get(scope), Some(value), "{scope}: the R4 client matches the published node");
+            assert_eq!(self.replicas[scope].doc, document(scope, value).unwrap(), "{scope}");
         }
-        for scope in self.replicas.keys() {
-            if !documents.contains_key(scope) {
-                self.released.insert(scope.clone());
-            }
-        }
+        assert_eq!(nodes.keys().collect::<Vec<_>>(), documents.keys().collect::<Vec<_>>(), "the R4 client holds exactly the published scopes");
     }
 
-    /// The events `scope` received, in order.
+    /// R4 changes addressing this scope, relative to its node for path assertions.
     fn events_of(&self, scope: &str) -> Vec<Value> {
-        self.history
-            .iter()
-            .flatten()
-            .filter(|event| event["scope"] == scope)
-            .cloned()
-            .collect()
+        self.history.iter().flatten().flat_map(|event| scope_changes(event, scope)).collect()
     }
 
     /// Whether some document `scope` went through, from the cut on, matches.
@@ -402,8 +385,8 @@ impl Peer {
     // -- Client side ---------------------------------------------------------
 
     /// Follows `scopes` on the feed (protocol §5.1) and asks the bridge to serve the streams.
-    fn subscribe(&self, scopes: Vec<Subscribed>) -> FeedSubscription {
-        let subscription = self.publication.lock().feed.subscribe(&scopes);
+    fn subscribe(&self, query: StreamQuery) -> TreeSubscription {
+        let subscription = self.publication.lock().feed.subscribe_tree(&query);
         self.commands.send(BridgeInput::ServeStreams).unwrap();
         subscription
     }
@@ -421,10 +404,10 @@ impl Peer {
             let lock = self.lock();
             let state = lock.lock().await;
             let published = state.protocol.publication.lock();
-            published.feed.live(&scope).expect("a published scope")["op"]["id"]
-                .as_str()
-                .unwrap()
-                .to_string()
+            published.feed.with_tree(|tree| {
+                tree.get(&path_of(&scope.to_string())).expect("a published scope")
+                    .child("op").unwrap().to_value()["id"].as_str().unwrap().to_string()
+            })
         };
         self.write_request(
             scope,
@@ -760,7 +743,7 @@ impl Peer {
         self.gate
             .replicas
             .get(scope)
-            .map_or(Value::Null, Replica::live)
+            .map_or(Value::Null, Document::live)
     }
 
     /// The entries the scope's replica holds.
@@ -768,7 +751,7 @@ impl Peer {
         self.gate
             .replicas
             .get(scope)
-            .map_or_else(Vec::new, Replica::entries)
+            .map_or_else(Vec::new, Document::entries)
     }
 
     fn has(&self, scope: &str) -> bool {
@@ -868,6 +851,44 @@ fn patch_paths(event: &Value) -> Vec<(String, String)> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Select actual R4 changes. For a tap following `/sessions`, strip only the session's
+/// pointer prefix; no operation or snapshot is synthesized from the resulting document.
+fn scope_changes(event: &Event, scope: &str) -> Vec<Value> {
+    let path = path_of(scope);
+    event.changes.iter().flatten().filter_map(|change| {
+        if change.path() == path {
+            return Some(serde_json::to_value(change).unwrap());
+        }
+        if change.path() != "/sessions" || !scope.starts_with("session/") {
+            return None;
+        }
+        let prefix = path.strip_prefix("/sessions").unwrap();
+        match change {
+            Change::Ops { ops, .. } => {
+                let ops: Vec<Value> = ops.iter().filter_map(|op| {
+                    let mut value = serde_json::to_value(op).unwrap();
+                    let relative = value["path"].as_str()?.strip_prefix(prefix)?;
+                    if !relative.is_empty() && !relative.starts_with('/') { return None; }
+                    value["path"] = json!(relative);
+                    Some(value)
+                }).collect();
+                (!ops.is_empty()).then(|| json!({ "path": path, "ops": ops }))
+            }
+            Change::Snapshot { snapshot, .. } => {
+                use crate::protocol::tree_stream::wire::SNode;
+                let id = scope.strip_prefix("session/").unwrap();
+                let contains = match &snapshot.node {
+                    SNode::Value { v } => v.get(id).is_some(),
+                    SNode::Map { m, .. } => m.iter().any(|key| key == id),
+                    _ => false,
+                };
+                contains.then(|| serde_json::to_value(change).unwrap())
+            }
+            Change::End { .. } => None,
+        }
+    }).collect()
 }
 
 /// The text of the agent messages among `entries`, chunk after chunk.
@@ -973,7 +994,7 @@ fn publish(
     feed: &crate::protocol::feed::FeedHandle,
     commits: &mut mpsc::UnboundedReceiver<TapCommit>,
     registry: &SessionRegistry,
-) -> (Vec<Value>, Documents) {
+) -> (Vec<Event>, Documents) {
     feed.commit(registry, &ready_agent(), 0);
     match commits.try_recv() {
         Ok(commit) => (commit.events, commit.documents),
@@ -981,12 +1002,13 @@ fn publish(
     }
 }
 
-fn tapped_feed() -> (
+fn tapped_feed(registry: &SessionRegistry) -> (
     crate::protocol::feed::FeedHandle,
     mpsc::UnboundedReceiver<TapCommit>,
-    Documents,
+    TapCommit,
 ) {
-    let feed = crate::protocol::feed::FeedHandle::new("process");
+    let feed = crate::protocol::feed::FeedHandle::new();
+    feed.commit(registry, &ready_agent(), 0);
     let (tap, commits) = mpsc::unbounded_channel();
     let cut = feed.tap(tap);
     (feed, commits, cut)
@@ -995,8 +1017,7 @@ fn tapped_feed() -> (
 #[test]
 fn ever_sees_a_change_of_a_scope_aligned_by_the_cut() {
     let mut registry = SessionRegistry::new("epoch");
-    let (feed, mut commits, _) = tapped_feed();
-    let (_, cut) = publish(&feed, &mut commits, &registry);
+    let (feed, mut commits, cut) = tapped_feed(&registry);
     let mut gate = Gate::new(&cut);
     registry
         .upsert_elicitation("epoch", None, "brief", json!({"mode": "form"}))
@@ -1019,11 +1040,10 @@ fn ever_sees_a_change_of_a_scope_aligned_by_the_cut() {
 #[should_panic(expected = "session/s")]
 fn the_gate_rejects_an_entry_change_without_its_event() {
     let mut registry = SessionRegistry::new("epoch");
-    let (feed, mut commits, _) = tapped_feed();
     registry
         .open_new("epoch", "s", "/s", json!({"sessionId": "s"}))
         .unwrap();
-    let (_, cut) = publish(&feed, &mut commits, &registry);
+    let (feed, mut commits, cut) = tapped_feed(&registry);
     let mut gate = Gate::new(&cut);
     registry
         .append_session_update(
@@ -1033,47 +1053,45 @@ fn the_gate_rejects_an_entry_change_without_its_event() {
         .unwrap();
     let (events, documents) = publish(&feed, &mut commits, &registry);
     assert!(
-        events.iter().any(|event| event["scope"] == "session/s"),
+        events.iter().any(|event| !scope_changes(event, "session/s").is_empty()),
         "the change is session-only: {events:?}"
     );
     let dropped = events
         .into_iter()
-        .filter(|event| event["scope"] != "session/s")
+        .filter(|event| scope_changes(event, "session/s").is_empty())
         .collect();
     gate.apply(dropped, &documents);
 }
 
-fn synthetic(rev: u64, doc: Value) -> Value {
-    json!({"scope": "session/s", "snapshot": {
-        "epoch": "e", "rev": rev, "digest": "d", "doc": doc,
-    }})
+fn synthetic(rev: u64, node: Value) -> TapCommit {
+    let event = serde_json::from_value(json!({
+        "instance": "e", "rev": rev, "changes": [{
+            "path": "/sessions", "snapshot": {
+                "base": null, "at": rev, "hash": "fixture", "node": {"v": {"s": node}},
+            },
+        }],
+    })).unwrap();
+    TapCommit {
+        events: vec![event],
+        documents: BTreeMap::from([("session/s".into(), node)]),
+    }
 }
 
 #[test]
 #[should_panic(expected = "in one event")]
 fn the_atomic_check_rejects_a_prompt_that_ends_before_its_operation() {
     let prompts = json!([{"entry": 0}]);
-    let running = json!({"prompts": prompts, "live": {"op": {"id": "p", "status": "running"}}});
-    let ended = json!({"prompts": prompts, "live": {"op": {"id": "p", "status": "completed"}}});
-    let scope = "session/s".to_string();
-    let mut gate = Gate::new(&BTreeMap::from([(scope.clone(), synthetic(0, running))]));
-    let completes = json!({"scope": scope, "rev": 1, "ops": [
-        {"op": "set", "path": "/live/op/status", "value": "completed"},
-    ]});
-    gate.apply(
-        vec![completes],
-        &BTreeMap::from([(scope.clone(), synthetic(1, ended.clone()))]),
-    );
+    let running = json!({"prompts": prompts, "op": {"id": "p", "status": "running"}});
+    let ended = json!({"prompts": prompts, "op": {"id": "p", "status": "completed"}});
+    let scope = "session/s";
+    let mut gate = Gate::new(&synthetic(1, running));
+    let completes = synthetic(2, ended.clone());
+    gate.apply(completes.events, &completes.documents);
     let mut with_end = ended;
     with_end["prompts"][0]["end"] = json!({"response": {"stopReason": "end_turn"}});
-    let end = json!({"scope": scope, "rev": 2, "ops": [
-        {"op": "set", "path": "/prompts/0/end", "value": {"response": {"stopReason": "end_turn"}}},
-    ]});
-    gate.apply(
-        vec![end],
-        &BTreeMap::from([(scope.clone(), synthetic(2, with_end))]),
-    );
-    gate.assert_ended_atomically(&scope, &json!("p"));
+    let end = synthetic(3, with_end);
+    gate.apply(end.events, &end.documents);
+    gate.assert_ended_atomically(scope, &json!("p"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1308,7 +1326,7 @@ async fn a_set_mode_action_folds_its_acknowledgement_and_installs_no_operation()
     let event = peer.events_of(&scope).pop().unwrap();
     let paths = patch_paths(&event);
     assert!(
-        paths.iter().all(|(_, path)| path.starts_with("/live/controls/")),
+        paths.iter().all(|(_, path)| path.starts_with("/controls/")),
         "the acknowledgement changes controls and nothing else: {event}"
     );
     peer.settled().await;
@@ -1335,15 +1353,13 @@ async fn a_create_completes_with_its_session_and_advances_the_catalog() {
         .gate
         .history
         .iter()
-        .position(|events| events.iter().any(|event| event["scope"] == scope))
+        .position(|events| events.iter().any(|event| !scope_changes(event, &scope).is_empty()))
         .unwrap();
     assert!(
         peer.gate.history[appeared]
             .iter()
-            .any(|event| event["scope"] == "global"
-                && patch_paths(event)
-                    .iter()
-                    .any(|(_, path)| path.starts_with("/live/op"))),
+            .flat_map(|event| scope_changes(event, "global"))
+            .any(|change| patch_paths(&change).iter().any(|(_, path)| path.starts_with("/op"))),
         "the target appears in the commit that completes the create"
     );
     assert_ne!(peer.live("catalog")["revision"], revision);
@@ -1696,6 +1712,7 @@ async fn a_delete_takes_the_close_interaction_and_ends_the_scope_with_deleted() 
     peer.create(CREATED, json!({})).await;
     let scope = format!("session/{CREATED}");
     let revision = peer.live("catalog")["revision"].clone();
+    let mut stream = stream_harness::Stream::open(&peer, &[&scope], None);
     let (op, _) = peer
         .start_op("global", "delete", json!({"sessionId": CREATED}))
         .await;
@@ -1737,12 +1754,8 @@ async fn a_delete_takes_the_close_interaction_and_ends_the_scope_with_deleted() 
         peer.live("global")["op"]["status"] == "completed"
     })
     .await;
-    let ended = peer
-        .events_of(&scope)
-        .into_iter()
-        .find(|event| event.get("end").is_some())
-        .expect("the deleted scope ends");
-    assert_eq!(ended["end"]["reason"], "deleted");
+    stream.until(&mut peer, "the deleted path ends", |stream| stream.ended.contains_key(&scope)).await;
+    assert_eq!(stream.ended[&scope]["reason"], "deleted");
     assert!(!peer.has(&scope));
     assert!(peer.live("global")["sessions"].get(CREATED).is_none());
     assert_eq!(peer.live("global")["op"]["id"], op);
@@ -1798,6 +1811,7 @@ async fn a_failed_delete_rejects_a_delayed_prompt_and_allows_one_new_request() {
     peer.create(CREATED, json!({})).await;
     let scope = format!("session/{CREATED}");
     let target = format!("sessions/{CREATED}");
+    let mut stream = stream_harness::Stream::open(&peer, &[&scope], None);
     let (delayed, receipt) = peer.prepared_prompt(&target);
     let own = peer.live(&scope)["op"]["id"].clone();
     let (op, _) = peer
@@ -1816,11 +1830,11 @@ async fn a_failed_delete_rejects_a_delayed_prompt_and_allows_one_new_request() {
     assert_ne!(peer.live(&scope)["op"]["id"], own);
     assert_eq!(peer.live(&scope)["op"]["id"], op);
     assert_eq!(peer.live(&scope)["op"]["status"], "failed");
-    assert!(
-        peer.events_of(&scope)
-            .iter()
-            .all(|event| event.get("end").is_none())
-    );
+    stream.until(&mut peer, "the failed delete is visible on the session stream", |stream| {
+        stream.live(&scope)["op"]["status"] == "failed"
+    }).await;
+    assert!(stream.ended.is_empty(), "a failed delete does not end its session path");
+    assert!(stream.events_of(&scope).iter().all(|change| change.get("end").is_none()));
     assert_eq!(peer.outcome(&target, &receipt)["outcome"], "superseded");
     // The delayed original reaches ingress before any subsequent write can hide a return to
     // the old ID. It must already be stale, and a refused prompt adds no user entry.
@@ -2293,8 +2307,8 @@ async fn the_connection_end_fails_running_operations_and_publishes_the_final_age
     // URL flow ended, nothing needs it, and the connection's end releases it from the final
     // documents (S6).
     let published = peer.publication.lock();
-    assert!(published.feed.live(&Scope::parse(&scope).unwrap()).is_none());
-    let summary = published.feed.live(&Scope::Global).unwrap();
+    assert!(published.feed.with_tree(|tree| tree.get(&path_of(&scope)).is_none()));
+    let summary = published.feed.with_tree(|tree| tree.get("/global").unwrap().to_value());
     assert!(summary["sessions"].get(CREATED).is_none(), "{summary}");
     assert!(global["sessions"].get(CREATED).is_none(), "{global}");
 }
@@ -2319,11 +2333,11 @@ async fn a_failed_connection_publishes_the_agent_error() {
 async fn the_same_history_gives_the_same_entries_after_a_restart() {
     async fn load(replay: &[Value]) -> Vec<Value> {
         let mut peer = Peer::start(json!({"loadSession": true})).await;
-        let _stream = peer.subscribe(vec![Subscribed {
-            scope: Scope::Session("saved".into()),
-            have: None,
-            cwd: Some("/workspace".into()),
-        }]);
+        let _stream = peer.subscribe(StreamQuery {
+            follow: vec![Follow { path: "/sessions/saved".into(), have: None, window: None }],
+            cwd: BTreeMap::from([("saved".into(), "/workspace".into())]),
+            ..Default::default()
+        });
         let request = peer.request("session/load").await;
         for update in replay {
             peer.update("saved", update.clone()).await;
@@ -2354,15 +2368,16 @@ mod reconnection;
 mod review_lifecycle;
 mod stream_harness;
 
-// -- The revision 3 feed (docs/protocol.md §5) ----------------------------------------
+// -- The revision 4 feed --------------------------------------------------------------
 
-/// The versions the feed publishes, by scope.
-fn feed_versions(peer: &Peer) -> std::collections::BTreeMap<String, u64> {
-    let feed = peer.publication.lock().feed.clone();
-    ["global", "catalog", "session/created", "session/other"]
-        .into_iter()
-        .filter_map(|scope| feed.version(scope).map(|(_, rev)| (scope.to_string(), rev)))
-        .collect()
+/// The path versions the feed publishes.
+fn feed_versions(peer: &Peer) -> BTreeMap<String, u64> {
+    peer.publication.lock().feed.with_tree(|tree| {
+        ["global", "catalog", "session/created", "session/other"]
+            .into_iter()
+            .filter_map(|scope| tree.get(&path_of(scope)).map(|node| (scope.to_string(), node.srev())))
+            .collect()
+    })
 }
 
 #[tokio::test]
@@ -2373,21 +2388,14 @@ async fn every_commit_of_the_bridge_is_published_by_the_feed_too() {
 
     peer.create("created", json!({})).await;
     let versions = feed_versions(&peer);
-    assert_eq!(versions.get("session/created"), Some(&0), "the session is published: {versions:?}");
+    let created = *versions.get("session/created").expect("the session is published");
+    assert!(created > 0, "the tree assigns the creation commit's revision");
 
-    // A later change of the session is the next rev of the same document.
     peer.update("created", chunk("m", text("hello"))).await;
-    peer.timeline_len("created", 1).await;
-    for _ in 0..200 {
-        if feed_versions(&peer).get("session/created").is_some_and(|rev| *rev >= 1) {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    assert!(
-        feed_versions(&peer).get("session/created").is_some_and(|rev| *rev >= 1),
-        "an update that changed the timeline is a later rev"
-    );
+    peer.until("an update advances the session path", |peer| {
+        agent_text(&peer.entries("session/created")) == "hello"
+    }).await;
+    assert!(feed_versions(&peer)["session/created"] > created, "an update that changed the timeline has a later path version");
     peer.settled().await;
 }
 
@@ -2396,23 +2404,21 @@ async fn a_subscription_to_the_feed_is_aligned_and_then_follows_the_bridge() {
     let mut peer = Peer::start(json!({})).await;
     peer.create("created", json!({})).await;
     let feed = peer.publication.lock().feed.clone();
-    let subscription = feed.subscribe(&[crate::protocol::subscription::Subscribed {
-        scope: Scope::Session("created".into()),
-        have: None,
-        cwd: None,
-    }]);
+    let subscription = feed.subscribe_tree(&StreamQuery {
+        follow: vec![Follow { path: "/sessions/created".into(), have: None, window: None }],
+        ..Default::default()
+    });
+    let mut client = Client::following(&["/sessions/created"]);
     let aligned = tokio::time::timeout(WAIT, subscription.next()).await.unwrap().unwrap();
-    let crate::protocol::engine::StreamEvent::Snapshot { snapshot, .. } = aligned else {
-        panic!("the first event is a snapshot");
-    };
-    assert_eq!(snapshot.doc["live"]["sessionId"], "created");
+    assert!(matches!(&aligned.changes.as_ref().unwrap()[0], Change::Snapshot { .. }), "the first event is a snapshot");
+    client.apply(&aligned).unwrap();
+    assert_eq!(client.value("/sessions/created").unwrap()["sessionId"], "created");
 
     peer.update("created", chunk("m", text("hello"))).await;
     let next = tokio::time::timeout(WAIT, subscription.next()).await.unwrap().unwrap();
-    assert!(
-        matches!(next, crate::protocol::engine::StreamEvent::Ops { .. }),
-        "the bridge's change reaches the subscriber: {next:?}"
-    );
+    assert!(matches!(&next.changes.as_ref().unwrap()[0], Change::Ops { .. }), "the bridge's change reaches the subscriber: {next:?}");
+    client.apply(&next).unwrap();
+    assert_eq!(agent_text(client.value("/sessions/created").unwrap()["entries"].as_array().unwrap()), "hello");
     peer.settled().await;
 }
 

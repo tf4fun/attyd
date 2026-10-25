@@ -237,6 +237,7 @@ pub(crate) struct OpRecord {
 pub(crate) const OP_LOG: usize = 64;
 
 /// What is remembered of the operations of one target.
+#[cfg_attr(test, derive(Clone))]
 #[derive(Default)]
 struct TargetLog {
     /// The `op.id` the target showed at the last commit; none before the first.
@@ -247,6 +248,7 @@ struct TargetLog {
 /// How many failed loads `/global/loadFailures` keeps (design §6.2).
 pub(crate) const LOAD_FAILURES: usize = 64;
 
+#[cfg_attr(test, derive(Clone))]
 #[derive(Default)]
 pub(crate) struct Projector {
     sessions: BTreeMap<String, Memo>,
@@ -258,6 +260,7 @@ pub(crate) struct Projector {
 }
 
 /// What is remembered of one held session.
+#[cfg_attr(test, derive(Clone))]
 #[derive(Default)]
 struct Memo {
     entries: Vec<PublishedEntry>,
@@ -274,6 +277,7 @@ struct Memo {
     prompts: Vec<(Prompt, Arc<Value>)>,
 }
 
+#[cfg_attr(test, derive(Clone))]
 struct PublishedEntry {
     source: Arc<Entry>,
     value: Arc<Value>,

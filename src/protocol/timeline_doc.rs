@@ -1,28 +1,29 @@
-//! The timeline half of a session document (docs/protocol.md §3).
+//! Entry and attachment projection for the revision 4 tree (docs/protocol-r4-design.md §4).
 //!
 //! The memory model's entries are published as they are, except that a content
 //! block carrying bytes (an image, audio or an embedded resource) is replaced
 //! by an `AttachmentRef`. The reference's `id` names the block's *exact form*
 //! (protocol §8), which keeps every integer exact, so two blocks that differ
-//! only in an integer beyond 2^53 have different IDs; the document digest
-//! (`digest.rs`) works over doubles and cannot tell them apart.
+//! only in an integer beyond 2^53 have different IDs; JCS hashing works over
+//! doubles and cannot tell them apart.
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::canon::{AttachmentKind, AttachmentRef, AttachmentTag, canonical_number, write_string};
-use super::timeline::{Entry, History, Prompt, Timeline};
+use super::timeline::Entry;
 
 /// The blocks the published entries reference, by attachment ID, as the bridge
 /// retains them (protocol §8). Built while entries are published; a block is
 /// served while a published entry still references it, counted per reference.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[cfg_attr(test, derive(Clone))]
+#[derive(Debug, Default, PartialEq)]
 pub(crate) struct AttachmentIndex(HashMap<String, Held>);
 
-#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(test, derive(Clone))]
+#[derive(Debug, PartialEq)]
 struct Held {
     block: Arc<Value>,
     references: usize,
@@ -33,6 +34,7 @@ impl AttachmentIndex {
         self.0.get(id).map(|held| &*held.block)
     }
 
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.0.len()
     }
@@ -143,6 +145,7 @@ fn byte_block(block: &Value) -> Option<(AttachmentKind, Option<String>, Option<S
 /// A content block as it is published: text and resource links stay inline with
 /// their annotations and `_meta`; a byte-carrying block becomes a reference and
 /// is kept in `index`.
+#[cfg(test)]
 pub(crate) fn publish_block(block: &Value, index: &mut AttachmentIndex) -> Value {
     publish_owned(block.clone(), index, &mut Vec::new())
 }
@@ -172,6 +175,7 @@ fn publish_member(parent: &mut Value, key: &str, index: &mut AttachmentIndex, id
 }
 
 /// An entry as it is published: its content blocks as `publish_block` writes them.
+#[cfg(test)]
 pub(crate) fn publish_entry(entry: &Entry, index: &mut AttachmentIndex) -> Value {
     publish_entry_referencing(entry, index).0
 }
@@ -206,43 +210,6 @@ pub(crate) fn publish_entry_referencing(entry: &Entry, index: &mut AttachmentInd
         Entry::Plan(_) => {}
     }
     (value, ids)
-}
-
-/// A session document's history, entries and prompts (protocol §3). While the
-/// history is unknown there are no entries, which is not an empty list.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub(crate) struct TimelineDoc {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub history: Option<History>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub entries: Option<Vec<Value>>,
-    pub prompts: Vec<Prompt>,
-}
-
-/// The timeline half of a session document, with its attachments in `index`.
-pub(crate) fn timeline_doc(
-    timeline: Option<&Timeline>,
-    history: Option<History>,
-    index: &mut AttachmentIndex,
-) -> TimelineDoc {
-    match timeline {
-        None => TimelineDoc {
-            history: None,
-            entries: None,
-            prompts: Vec::new(),
-        },
-        Some(timeline) => TimelineDoc {
-            history,
-            entries: Some(
-                timeline
-                    .entries()
-                    .iter()
-                    .map(|entry| publish_entry(entry, index))
-                    .collect(),
-            ),
-            prompts: timeline.prompts().to_vec(),
-        },
-    }
 }
 
 #[cfg(test)]

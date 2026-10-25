@@ -1,5 +1,5 @@
-//! The feed serves revision 4 streams beside revision 3's: each commit reaches the streams that
-//! follow a path it changed, and a stream's session is held like a scope subscription's.
+//! Each tree commit reaches the streams that follow a path it changed, and following a
+//! session's paths holds that session.
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -58,7 +58,7 @@ fn pump(feed: &mut Feed, id: SubscriptionId, client: &mut Client) -> usize {
 
 #[test]
 fn a_stream_is_aligned_with_the_tree_and_follows_its_commits() {
-    let mut feed = Feed::new("process");
+    let mut feed = Feed::new();
     let mut registry = registry();
     chunk(&mut registry, "hi");
     feed.commit(&registry, &agent(), 1);
@@ -83,29 +83,8 @@ fn a_stream_is_aligned_with_the_tree_and_follows_its_commits() {
 }
 
 #[test]
-fn revision_3_and_revision_4_streams_follow_the_same_commits() {
-    let mut feed = Feed::new("process");
-    let mut registry = registry();
-    feed.commit(&registry, &agent(), 1);
-    let scopes = feed.subscribe(&[crate::protocol::subscription::Subscribed {
-        scope: Scope::Session("s".into()),
-        have: None,
-        cwd: None,
-    }]);
-    let tree = feed.subscribe_tree(&query("follow=/sessions/s/entries"));
-    assert_eq!(feed.subscribers(), 2);
-    chunk(&mut registry, "x");
-    feed.commit(&registry, &agent(), 1);
-    assert!(feed.next(scopes).is_some());
-    assert!(feed.next_tree(tree).is_some());
-    feed.unsubscribe(tree);
-    feed.unsubscribe(scopes);
-    assert_eq!(feed.subscribers(), 0);
-}
-
-#[test]
 fn a_stream_of_an_unheld_session_waits_for_it_and_asks_for_its_load_with_the_cwd() {
-    let mut feed = Feed::new("process");
+    let mut feed = Feed::new();
     feed.commit(&SessionRegistry::new("epoch"), &agent(), 1);
     let id = feed.subscribe_tree(&query("follow=/sessions/s/entries&cwd=s:/work"));
     let followed = feed.followed_sessions();
@@ -123,7 +102,7 @@ fn a_stream_of_an_unheld_session_waits_for_it_and_asks_for_its_load_with_the_cwd
 
 #[test]
 fn a_view_or_session_path_both_hold_the_session() {
-    let mut feed = Feed::new("process");
+    let mut feed = Feed::new();
     feed.commit(&SessionRegistry::new("epoch"), &agent(), 1);
     feed.subscribe_tree(&query("follow=/views/a~1b/output/latest&follow=/global"));
     assert_eq!(feed.followed_sessions().keys().collect::<Vec<_>>(), ["a/b"]);
@@ -131,7 +110,7 @@ fn a_view_or_session_path_both_hold_the_session() {
 
 #[test]
 fn a_failed_load_ends_the_waiting_paths_with_an_error_summary_and_the_stream_stays() {
-    let mut feed = Feed::new("process");
+    let mut feed = Feed::new();
     feed.commit(&SessionRegistry::new("epoch"), &agent(), 1);
     let id = feed.subscribe_tree(&query("follow=/sessions/s/entries&cwd=s:/work"));
     let mut client = Client::following(&["/sessions/s/entries"]);
@@ -158,7 +137,7 @@ fn a_failed_load_ends_the_waiting_paths_with_an_error_summary_and_the_stream_sta
 
 #[test]
 fn a_session_that_went_with_a_reason_ends_its_paths_with_it() {
-    let mut feed = Feed::new("process");
+    let mut feed = Feed::new();
     feed.commit(&registry(), &agent(), 1);
     let id = feed.subscribe_tree(&query("follow=/sessions/s/entries"));
     let mut client = Client::following(&["/sessions/s/entries"]);
@@ -180,7 +159,7 @@ fn a_session_that_went_with_a_reason_ends_its_paths_with_it() {
 
 #[tokio::test(start_paused = true)]
 async fn a_changed_path_is_checked_after_the_pause_by_a_waiting_stream() {
-    let handle = FeedHandle::new("process");
+    let handle = FeedHandle::new();
     let mut registry = registry();
     handle.commit(&registry, &agent(), 1);
     let subscription = handle.subscribe_tree(&query("follow=/sessions/s/entries"));
@@ -208,7 +187,7 @@ fn failure(message: &str) -> End {
 
 #[test]
 fn a_failed_load_leaves_its_whole_error_in_global_and_a_stream_of_global_sees_it() {
-    let mut feed = Feed::new("process");
+    let mut feed = Feed::new();
     feed.commit(&SessionRegistry::new("epoch"), &agent(), 1);
     let id = feed.subscribe_tree(&query("follow=/global/loadFailures"));
     let mut client = Client::following(&["/global/loadFailures"]);
@@ -226,7 +205,7 @@ fn a_failed_load_leaves_its_whole_error_in_global_and_a_stream_of_global_sees_it
 
 #[test]
 fn a_failure_is_forgotten_when_the_session_is_held_or_deleted() {
-    let mut feed = Feed::new("process");
+    let mut feed = Feed::new();
     feed.commit(&SessionRegistry::new("epoch"), &agent(), 1);
     feed.end_waiting("s", &failure("a"));
     feed.end_waiting("t", &failure("b"));
@@ -246,7 +225,7 @@ fn a_failure_is_forgotten_when_the_session_is_held_or_deleted() {
 
 #[test]
 fn only_the_last_failures_are_kept() {
-    let mut feed = Feed::new("process");
+    let mut feed = Feed::new();
     feed.commit(&SessionRegistry::new("epoch"), &agent(), 1);
     for n in 0..70 {
         feed.end_waiting(&format!("s{n}"), &failure("x"));
@@ -259,7 +238,7 @@ fn only_the_last_failures_are_kept() {
 
 #[test]
 fn a_session_that_ends_with_a_failed_load_after_it_was_held_is_recorded_too() {
-    let mut feed = Feed::new("process");
+    let mut feed = Feed::new();
     feed.commit(&registry(), &agent(), 1);
     feed.commit_ending(
         &SessionRegistry::new("epoch"),
@@ -287,7 +266,7 @@ fn conversation(registry: &mut SessionRegistry, user: &str, agent_text: &str) {
 
 #[test]
 fn a_followed_view_is_materialized_at_once_and_follows_the_session_in_the_same_revision() {
-    let mut feed = Feed::new("process");
+    let mut feed = Feed::new();
     let mut registry = registry();
     conversation(&mut registry, "q", "one");
     feed.commit(&registry, &agent(), 1);
@@ -311,7 +290,7 @@ fn a_followed_view_is_materialized_at_once_and_follows_the_session_in_the_same_r
 
 #[test]
 fn a_view_no_one_follows_is_removed_at_the_next_commit() {
-    let mut feed = Feed::new("process");
+    let mut feed = Feed::new();
     let mut registry = registry();
     conversation(&mut registry, "q", "one");
     feed.commit(&registry, &agent(), 1);
@@ -326,7 +305,7 @@ fn a_view_no_one_follows_is_removed_at_the_next_commit() {
 
 #[test]
 fn a_read_keeps_its_view_for_a_while_so_a_poll_finds_the_same_version() {
-    let mut feed = Feed::new("process");
+    let mut feed = Feed::new();
     let mut registry = registry();
     conversation(&mut registry, "q", "one");
     feed.commit(&registry, &agent(), 1);
@@ -342,7 +321,7 @@ fn a_read_keeps_its_view_for_a_while_so_a_poll_finds_the_same_version() {
 
 #[test]
 fn a_stream_of_a_view_holds_the_session_like_the_session_does() {
-    let mut feed = Feed::new("process");
+    let mut feed = Feed::new();
     feed.commit(&SessionRegistry::new("epoch"), &agent(), 1);
     let id = feed.subscribe_tree(&query("follow=/views/s/output/latest&cwd=s:/work"));
     assert_eq!(feed.followed_sessions()["s"], vec![Waiting { id, cwd: Some("/work".into()) }]);
@@ -361,7 +340,7 @@ fn history_rev(feed: &Feed) -> u64 {
 
 #[test]
 fn a_fixed_view_ends_when_its_turn_is_gone_or_its_history_replaced_and_stays_ended() {
-    let mut feed = Feed::new("process");
+    let mut feed = Feed::new();
     let mut registry = registry();
     conversation(&mut registry, "q", "one");
     feed.commit(&registry, &agent(), 1);
@@ -391,7 +370,7 @@ fn a_fixed_view_ends_when_its_turn_is_gone_or_its_history_replaced_and_stays_end
 
 #[test]
 fn a_fixed_view_of_another_instance_or_history_is_replaced_whatever_the_client_holds() {
-    let mut feed = Feed::new("process");
+    let mut feed = Feed::new();
     let mut registry = registry();
     conversation(&mut registry, "q", "one");
     feed.commit(&registry, &agent(), 1);
@@ -410,7 +389,7 @@ fn a_fixed_view_of_another_instance_or_history_is_replaced_whatever_the_client_h
 
 #[test]
 fn a_fixed_view_of_a_session_not_loaded_yet_waits_and_is_replaced_once_it_is_loaded_otherwise() {
-    let mut feed = Feed::new("process");
+    let mut feed = Feed::new();
     feed.commit(&SessionRegistry::new("epoch"), &agent(), 1);
     let path = format!("/views/s/history/{}/1/output/0", feed.tree().instance());
     let id = feed.subscribe_tree(&query(&format!("follow={path}&cwd=s:/work")));

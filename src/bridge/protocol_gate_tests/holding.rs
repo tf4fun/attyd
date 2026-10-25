@@ -43,6 +43,12 @@ async fn subscribers_hold_a_loadable_session_and_the_last_one_leaving_releases_i
         peer.events_of(&scope).iter().all(|event| event.get("end").is_none()),
         "a release sends no end"
     );
+    assert!(
+        peer.events_of(&scope).last().is_some_and(|change| {
+            patch_paths(change).iter().any(|(op, path)| op == "remove" && path.is_empty())
+        }),
+        "R4 removes the released session from the followed sessions map"
+    );
     assert!(!peer.published(&scope));
     let cached = first.entries(&scope);
     assert_eq!(cached.len(), 2, "the client keeps its copy");
@@ -87,6 +93,12 @@ async fn a_loadable_session_without_close_is_released_locally() {
     assert!(
         peer.events_of(&scope).iter().all(|event| event.get("end").is_none()),
         "a release sends no end"
+    );
+    assert!(
+        peer.events_of(&scope).last().is_some_and(|change| {
+            patch_paths(change).iter().any(|(op, path)| op == "remove" && path.is_empty())
+        }),
+        "R4 removes the released session from the followed sessions map"
     );
     assert!(!peer.published(&scope));
 

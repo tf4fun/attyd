@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Compare the same opt-in production-path benchmark before and after the #216 work.
+"""Compare complete Feed publication costs before and after removing the R3 publisher.
 
-Run in CI, on one runner, sequentially. Only fixture construction is adapted to the old
-view API; the baseline production code is unchanged. Timings are evidence, not gates.
+Run in CI, on one runner, sequentially. Only the fixture's Feed constructor is adapted to
+the old API; the baseline production code is unchanged. Timings are evidence, not gates.
 """
 import argparse
 import os
@@ -15,10 +15,10 @@ import tempfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
-BASELINE = "ff9890e"
-FIXTURE = Path("src/protocol/tree_doc/perf_tests.rs")
+BASELINE = "ab4f0c5"
+FIXTURE = Path("src/protocol/feed/perf_tests.rs")
 ROW = re.compile(
-    r"single_chunk entries=2000 turns=500 output=(\d+) chunks=(\d+) mode=(\w+) "
+    r"feed_single_chunk entries=2000 turns=500 output=(\d+) chunks=(\d+) mode=(\w+) "
     r"median_us=(\d+) p95_us=(\d+) allocation_bytes=(\d+) allocation_calls=(\d+)"
 )
 
@@ -53,18 +53,16 @@ def main():
             source.extractall(before, filter="data")
         archive.unlink()
         fixture = (ROOT / FIXTURE).read_text()
-        if "derive_cached" not in (before / "src/protocol/views.rs").read_text():
-            start = fixture.index("// BEGIN BENCH VIEW ADAPTER")
-            end = fixture.index("// END BENCH VIEW ADAPTER") + len("// END BENCH VIEW ADAPTER")
-            fixture = fixture[:start] + """#[derive(Default)]
-struct ViewCache;
-fn derive_views(tree: &Tree, wanted: &BTreeSet<View>, _: &mut ViewCache) -> Spec {
-    views::derive(tree, wanted)
-}
-""" + fixture[end:]
+        module_path = before / "src/protocol/feed.rs"
+        module = module_path.read_text()
+        if "pub(crate) fn new(process_epoch:" in module:
+            start = fixture.index("// BEGIN BENCH FEED ADAPTER")
+            end = fixture.index("// END BENCH FEED ADAPTER") + len("// END BENCH FEED ADAPTER")
+            fixture = fixture[:start] + 'fn new_feed() -> Feed { Feed::new("epoch") }\n' + fixture[end:]
+        (before / FIXTURE).parent.mkdir(parents=True, exist_ok=True)
         (before / FIXTURE).write_text(fixture)
-        with (before / "src/protocol/tree_doc.rs").open("a") as module:
-            module.write("\n#[cfg(test)]\nmod perf_tests;\n")
+        if "mod perf_tests;" not in module:
+            module_path.write_text(module + "\n#[cfg(test)]\nmod perf_tests;\n")
         shutil.copytree(ROOT / "dist/client", before / "dist/client")
         for label, checkout in [("before", before), ("after", ROOT)]:
             log_path = output / f"{label}.log"
@@ -73,15 +71,16 @@ fn derive_views(tree: &Tree, wanted: &BTreeSet<View>, _: &mut ViewCache) -> Spec
                 # fingerprint from another checkout. No concurrent builds use this runner.
                 run(["cargo", "clean", "--release", "-p", "attyd"], checkout, env, log)
                 os.utime(checkout / "src/main.rs", None)
-                run(["cargo", "test", "--release", "--locked", "single_chunk_in_a_long_session",
+                run(["cargo", "test", "--release", "--locked", "feed_single_chunk_in_a_long_session",
                      "--", "--ignored", "--nocapture", "--test-threads=1"], checkout, env, log)
             rows = ROW.findall(log_path.read_text())
-            if len(rows) != 9:
-                raise RuntimeError(f"{label}: expected nine benchmark rows, found {len(rows)}")
+            if len(rows) != 6:
+                raise RuntimeError(f"{label}: expected six benchmark rows, found {len(rows)}")
             results[label] = rows
-    summary = ["## Protocol publication benchmark", "", f"Before: `{baseline}`; after: `{current}`.",
+    summary = ["## Complete Feed publication benchmark", "", f"Before: `{baseline}`; after: `{current}`.",
                "", "Same runner and release profile; 2,000 entries / 500 turns; 5 warm-ups and 30 measured updates per row.",
-               "Allocation figures count requested bytes, not RSS or peak memory. Commit includes reducer, projection and tree reconciliation; checkpoint adds session/output hashes; window adds output-window publication.",
+               "Each sample measures only production `Feed::commit_ending`, including every publisher it runs and subscriber queueing. The reducer runs before measurement; construction, assertions, queue consumption and network I/O are excluded. The window case follows a 4 KiB output window and consumes each event between commits; unfollowed has no subscribers.",
+               "Allocation figures count requested bytes, not RSS or peak memory. This measures publication of a small append, not checkpoint timing, serialization by the HTTP response, or end-to-end Agent latency.",
                "", "| Output bytes / blocks | Mode | Median µs before → after | p95 µs before → after | Allocated bytes before → after | Allocations before → after |",
                "| --- | --- | --- | --- | --- | --- |"]
     for before, after in zip(results["before"], results["after"]):

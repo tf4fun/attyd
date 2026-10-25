@@ -1,7 +1,7 @@
 //! The harness of the stream tests: a client's subscription of the feed with its own replicas,
 //! and the scripted Agent's side of a load.
 use super::*;
-use crate::protocol::subscription::Have;
+
 
 pub(super) const SAVED: &str = "saved";
 pub(super) const CWD: &str = "/workspace";
@@ -37,8 +37,9 @@ pub(super) fn loadable() -> Value {
 /// outlive the subscription, as a client keeps its copies across streams.
 pub(super) struct Stream {
     scopes: Vec<Scope>,
-    pub(super) subscription: Option<FeedSubscription>,
-    pub(super) replicas: BTreeMap<String, Replica>,
+    pub(super) subscription: Option<TreeSubscription>,
+    pub(super) client: Client,
+    pub(super) replicas: BTreeMap<String, Document>,
     /// How each scope ended, if it did.
     pub(super) ended: BTreeMap<String, Value>,
     /// Every event taken, in order.
@@ -50,6 +51,7 @@ impl Stream {
         let mut stream = Self {
             scopes: scopes.iter().map(|scope| Scope::parse(scope).unwrap()).collect(),
             subscription: None,
+            client: Client::following(&scopes.iter().map(|scope| path_of(scope)).collect::<Vec<_>>().iter().map(String::as_str).collect::<Vec<_>>()),
             replicas: BTreeMap::new(),
             ended: BTreeMap::new(),
             events: Vec::new(),
@@ -60,19 +62,19 @@ impl Stream {
 
     /// Subscribes with the versions the replicas hold (protocol §5.1).
     pub(super) fn subscribe(&mut self, peer: &Peer, cwd: Option<&str>) {
-        let follow = self
-            .scopes
-            .iter()
-            .map(|scope| Subscribed {
-                scope: scope.clone(),
-                have: self.replicas.get(&scope.to_string()).map(|replica| Have {
-                    epoch: replica.epoch.clone(),
-                    rev: replica.rev,
-                }),
-                cwd: cwd.map(String::from),
-            })
-            .collect::<Vec<_>>();
-        self.subscription = Some(peer.subscribe(follow));
+        let query = StreamQuery {
+            instance: self.client.instance.clone(),
+            follow: self.scopes.iter().map(|scope| {
+                let path = path_of(&scope.to_string());
+                let have = self.client.value(&path).map(|_| self.client.version(&path));
+                Follow { path, have, window: None }
+            }).collect(),
+            cwd: self.scopes.iter().filter_map(|scope| match scope {
+                Scope::Session(id) => cwd.map(|cwd| (id.clone(), cwd.to_string())),
+                _ => None,
+            }).collect(),
+        };
+        self.subscription = Some(peer.subscribe(query));
     }
 
     /// Closes the stream and subscribes again with the versions it holds.
@@ -85,26 +87,36 @@ impl Stream {
         self.subscription = None;
     }
 
-    fn take(&mut self, event: crate::protocol::engine::StreamEvent) {
-        let event = serde_json::to_value(event).unwrap();
-        let scope = event["scope"].as_str().unwrap().to_string();
-        if let Some(end) = event.get("end") {
-            self.replicas.remove(&scope);
-            self.ended.insert(scope, end.clone());
-        } else {
-            self.replicas
-                .entry(scope)
-                .or_default()
-                .apply(&event)
-                .unwrap_or_else(|error| panic!("{error}"));
+    fn take(&mut self, event: Event) {
+        use crate::protocol::tree_stream::documents::scope_of;
+        self.client.apply(&event).unwrap_or_else(|error| panic!("{error}: {event:?}"));
+        self.replicas.clear();
+        for (path, held) in &self.client.paths {
+            let Some(scope) = scope_of(path) else { continue };
+            if let Some(doc) = held.value.as_ref().and_then(|value| document(&scope, value)) {
+                self.replicas.insert(scope, Document { doc, rev: held.version });
+            }
         }
-        self.events.push(event);
+        for change in event.changes.iter().flatten() {
+            let Some(scope) = scope_of(change.path()) else { continue };
+            let change = serde_json::to_value(change).unwrap();
+            if let Some(end) = change.get("end").filter(|end| end["reason"] != "absent") {
+                let mut end = end.clone();
+                if let Some(agent) = end["error"].get("agentCode").cloned() {
+                    end["error"]["data"] = json!({ "code": agent });
+                }
+                self.ended.insert(scope, end);
+            } else if self.replicas.contains_key(&scope) {
+                self.ended.remove(&scope);
+            }
+        }
+        self.events.push(serde_json::to_value(event).unwrap());
     }
 
     /// Takes every queued event.
     pub(super) fn take_all(&mut self, peer: &mut Peer) {
         peer.drain();
-        while let Some(event) = self.subscription.as_ref().and_then(FeedSubscription::try_next) {
+        while let Some(event) = self.subscription.as_ref().and_then(TreeSubscription::try_next) {
             self.take(event);
         }
     }
@@ -134,23 +146,24 @@ impl Stream {
     }
 
     pub(super) fn live(&self, scope: &str) -> Value {
-        self.replicas.get(scope).map_or(Value::Null, Replica::live)
+        self.replicas.get(scope).map_or(Value::Null, Document::live)
     }
 
     pub(super) fn entries(&self, scope: &str) -> Vec<Value> {
-        self.replicas.get(scope).map_or_else(Vec::new, Replica::entries)
+        self.replicas.get(scope).map_or_else(Vec::new, Document::entries)
     }
 
     pub(super) fn events_of(&self, scope: &str) -> Vec<Value> {
-        self.events.iter().filter(|event| event["scope"] == scope).cloned().collect()
+        self.events.iter().flat_map(|event| event["changes"].as_array().into_iter().flatten())
+            .filter(|change| change["path"] == path_of(scope)).cloned().collect()
     }
 
     /// Every followed scope equals what the bridge publishes now.
     pub(super) fn converged(&self, peer: &Peer) {
         let documents = peer.publication.lock().feed.documents();
         for (scope, replica) in &self.replicas {
-            let published = Replica::from_snapshot(&documents[scope]);
-            assert_eq!(replica.doc, published.doc, "{scope}");
+            assert_eq!(self.client.value(&path_of(scope)), documents.get(scope), "{scope}: native node");
+            assert_eq!(replica.doc, document(scope, &documents[scope]).unwrap(), "{scope}");
         }
     }
 }
@@ -254,11 +267,7 @@ impl Peer {
 
     /// Whether the feed publishes `scope`.
     pub(super) fn published(&self, scope: &str) -> bool {
-        self.publication
-            .lock()
-            .feed
-            .live(&Scope::parse(scope).unwrap())
-            .is_some()
+        self.publication.lock().feed.with_tree(|tree| tree.get(&path_of(scope)).is_some())
     }
 }
 

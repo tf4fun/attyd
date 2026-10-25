@@ -204,22 +204,27 @@ second backend. Client agreement cannot replace the direct source-memory tests.
 
 The opt-in CI job `protocol-benchmark` runs only for non-draft pull requests carrying
 the `protocol-benchmark` label. Add the label before marking ready or pushing the next
-commit. It runs `scripts/protocol-benchmark.py` on one runner, comparing `ff9890e` (before
-the #216 performance changes) with the tested head; `--baseline` selects another revision
-for a future performance review.
-The same ignored Rust fixture runs on both revisions; only its view-call adapter changes
-for the earlier API. The application is cleaned and rebuilt between revisions, while
-dependency artifacts are reused. Logs and a comparison table are uploaded as the
+commit. It runs `scripts/protocol-benchmark.py` on one runner, comparing `ab4f0c5` (before
+the internal R3 publisher was removed in #222) with the tested head; `--baseline` selects
+another revision for a future performance review.
+The same ignored Rust fixture in `src/protocol/feed/perf_tests.rs` runs on both revisions;
+only its `Feed::new` adapter changes for the earlier constructor. The application is cleaned
+and rebuilt between revisions, while dependency artifacts are reused. Logs and a comparison table are uploaded as the
 `protocol-benchmark` artifact and written to the job summary. There is no timing gate.
 
-Each case starts with 2,000 entries and 500 turns, a full operation log, and a warm hash.
-It measures one incoming text chunk through the production reducer, projection and tree
-commit, with 5 warm-ups and 30 samples. The three modes are commit alone, commit plus a
-session/output checkpoint, and commit plus publication to a 4 KiB output window. Current
-output sizes are 4 KiB and 1 MiB; the latter also runs with 256 metadata-separated blocks.
+Each case starts with 2,000 entries and 500 turns. It measures the production
+`Feed::commit_ending` after a small incoming text chunk, with 5 warm-ups and 30 samples.
+This includes all publishers the Feed runs and subscriber queueing, so the baseline
+includes the still-active R3 publisher. The reducer, fixture construction, assertions,
+subscriber consumption and network I/O are outside measurement. The two modes are no
+subscribers and one subscriber following a 4 KiB output window; its queue is consumed
+between commits. Current output sizes are 4 KiB and 1 MiB; the latter also runs with
+256 metadata-separated blocks, for six cases in all. Checkpoints and end-to-end Agent
+latency are not measured. The earlier `tree_doc::perf_tests` fixture remains available
+for separate projection/tree measurements; it is not the before/after CI comparison.
 The report includes median and p95 time and requested allocation bytes/counts. Allocation
-traffic is not peak memory or RSS; forcing a checkpoint after every chunk isolates its
-cost and does not model the normal checkpoint timer.
+traffic is not peak memory or RSS. The older projection fixture's forced checkpoints
+isolate hashing cost and do not model the normal checkpoint timer.
 
 The optimization preserves the complete tree and its ordinary reconciliation: it still
 walks the session's entries and turn index. Output views retain immutable JSON strings,

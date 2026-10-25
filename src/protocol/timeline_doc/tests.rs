@@ -1,10 +1,11 @@
-//! Direct cases for the timeline half of a session document (docs/protocol.md
-//! §3, §8). Expected attachment IDs were computed by an independent
+//! Direct cases for published entries and attachments (docs/protocol-r4-design.md
+//! §4). Expected attachment IDs were computed by an independent
 //! implementation (Python `hashlib` over the exact form), not by this module.
 
 use serde_json::{Value, json};
 
 use super::super::canon::canonical_json;
+use super::super::timeline::Timeline;
 use super::*;
 
 const IMAGE_ID: &str = "caf76d0a16892b770bf06da2da02838e5294dd0d4be88c85ff2efb98a0591f79";
@@ -128,8 +129,7 @@ fn every_position_that_carries_a_block_is_published_as_a_reference() {
     let mut index = AttachmentIndex::default();
     let reference = json!({ "type": "attachment", "id": IMAGE_ID, "block": "image",
                             "mimeType": "image/png" });
-    let doc = timeline_doc(Some(&timeline), Some(History::Complete), &mut index);
-    let entries = doc.entries.unwrap();
+    let entries: Vec<_> = timeline.entries().iter().map(|entry| publish_entry(entry, &mut index)).collect();
 
     assert_eq!(entries[0]["chunks"][0]["content"], reference);
     assert_eq!(entries[0]["chunks"][0]["_meta"], json!({ "chunk": 1 }), "chunk metadata stays");
@@ -139,43 +139,4 @@ fn every_position_that_carries_a_block_is_published_as_a_reference() {
     assert_eq!(entries[2]["summary"][1]["content"], text("kept"));
     assert_eq!(entries[3]["kind"], "plan");
     assert_eq!(index.len(), 1, "one image shared by three positions is kept once");
-}
-
-// --- The document --------------------------------------------------------------------
-
-#[test]
-fn an_unknown_history_has_no_entries_and_an_empty_known_one_has_none_listed() {
-    let mut index = AttachmentIndex::default();
-    let unknown = timeline_doc(None, None, &mut index);
-    assert_eq!(serde_json::to_value(&unknown).unwrap(), json!({ "prompts": [] }));
-
-    let empty = Timeline::default();
-    let known = timeline_doc(Some(&empty), Some(History::Complete), &mut index);
-    assert_eq!(
-        serde_json::to_value(&known).unwrap(),
-        json!({ "history": "complete", "entries": [], "prompts": [] })
-    );
-}
-
-#[test]
-fn history_prompts_and_their_outcomes_are_published() {
-    let mut timeline = Timeline::default();
-    timeline.begin_prompt(&[text("hi")]);
-    timeline.end_prompt(crate::protocol::timeline::PromptEnd::Response(
-        json!({ "stopReason": "end_turn" }),
-    ));
-    timeline.begin_prompt(&[text("again")]);
-    timeline.end_prompt(crate::protocol::timeline::PromptEnd::Interrupted(true));
-    let mut index = AttachmentIndex::default();
-    let doc = serde_json::to_value(timeline_doc(Some(&timeline), Some(History::Partial), &mut index))
-        .unwrap();
-    assert_eq!(doc["history"], "partial");
-    assert_eq!(doc["entries"].as_array().unwrap().len(), 2);
-    assert_eq!(
-        doc["prompts"],
-        json!([
-            { "entry": 0, "end": { "response": { "stopReason": "end_turn" } } },
-            { "entry": 1, "end": { "interrupted": true } },
-        ])
-    );
 }

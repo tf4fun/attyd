@@ -1247,9 +1247,10 @@ pub(crate) enum BridgeInput {
     /// A v2 stream (protocol §5.1): registers the subscription, holds and
     /// loads its unheld sessions, and joins distribution under one bridge
     /// guard.
+    #[cfg(test)]
     Subscribe {
-        scopes: Vec<crate::protocol::subscription::Subscribed>,
-        reply: oneshot::Sender<crate::protocol::feed::FeedSubscription>,
+        query: crate::protocol::tree_stream::params::StreamQuery,
+        reply: oneshot::Sender<crate::protocol::feed::TreeSubscription>,
     },
     /// Starts the next load v2 streams wait for.
     ServeStreams,
@@ -1292,8 +1293,9 @@ impl BridgeInput {
     /// The session whose order the input runs in, if any.
     fn session_id(&self) -> Option<&str> {
         match self {
-            Self::Subscribe { .. }
-            | Self::ServeStreams
+            #[cfg(test)]
+            Self::Subscribe { .. } => None,
+            Self::ServeStreams
             | Self::Resource { .. }
             | Self::Control { .. }
             | Self::Workspace { .. } => None,
@@ -1308,7 +1310,8 @@ impl BridgeInput {
     fn payload_bytes(&self) -> usize {
         let payload = match self {
             Self::ServeStreams => 0,
-            Self::Subscribe { scopes, .. } => scopes.len().saturating_mul(256),
+            #[cfg(test)]
+            Self::Subscribe { query, .. } => query.follow.len().saturating_mul(256),
             Self::RetireUnobservedSession { session_id, .. } => serialized_value_len(session_id),
             Self::FinishHistorySync { owner } => serialized_value_len(&(
                 &owner.session.epoch,
@@ -1332,7 +1335,9 @@ impl BridgeInput {
     /// dropping a sender alone loses the cause.
     fn reject(self, error: Error) {
         match self {
-            Self::Subscribe { .. } | Self::ServeStreams => {}
+            #[cfg(test)]
+            Self::Subscribe { .. } => {},
+            Self::ServeStreams => {}
             Self::RetireUnobservedSession { permit, .. } => {
                 permit.cancel();
             }
@@ -1708,9 +1713,10 @@ where
                     _ = cancellation.cancelled() => return Ok(()),
                     response = &mut request => break response?,
                     input = commands.recv(), if commands_open => match input {
-                        Some(BridgeInput::Subscribe { scopes, reply }) => {
+                        #[cfg(test)]
+                        Some(BridgeInput::Subscribe { query, reply }) => {
                             let state = state.lock().await;
-                            let _ = reply.send(streams::register(&state, &scopes));
+                            let _ = reply.send(streams::register(&state, &query));
                         }
                         Some(input) => {
                             let class = browser_traffic_class(&input);
@@ -1792,10 +1798,11 @@ where
                 let mut execution = Some(execution);
                 let mut auto_close = None;
                 let command = match input {
-                    Some(BridgeInput::Subscribe { scopes, reply }) => {
+                    #[cfg(test)]
+                    Some(BridgeInput::Subscribe { query, reply }) => {
                         let mut state = state.lock().await;
                         let (subscription, command) =
-                            streams::subscribe(&mut state, &scopes);
+                            streams::subscribe(&mut state, &query);
                         let _ = reply.send(subscription);
                         let Some(command) = command else {
                             continue;
@@ -6114,7 +6121,7 @@ mod tests {
     }
 
     async fn verify_stdio_clean_eof(exit_mode: &str, large: bool) {
-        use crate::protocol::replica::Replica;
+        use crate::protocol::tree_stream::{client::Client, documents::{Document, document}};
         let cwd = env!("CARGO_MANIFEST_DIR");
         let fixture = format!("{cwd}/tests/fixtures/burst-prompt-agent.mjs");
         let options = options(&["attyd", "--cwd", cwd, "--", "node", &fixture, exit_mode]);
@@ -6135,16 +6142,25 @@ mod tests {
             );
             // The session's v2 stream, as a client reads it.
             fn apply(
-                replica: &mut Replica,
+                client: &mut Client,
+                replica: &mut Document,
                 ops: &mut Vec<Value>,
-                event: crate::protocol::engine::StreamEvent,
+                event: crate::protocol::tree_stream::wire::Event,
             ) {
-                let event = serde_json::to_value(event).unwrap();
-                assert!(event.get("end").is_none(), "the stream ended: {event}");
-                replica.apply(&event).unwrap();
-                ops.push(replica.live()["op"].clone());
+                client.apply(&event).unwrap();
+                for change in event.changes.iter().flatten() {
+                    if let crate::protocol::tree_stream::wire::Change::End { end, .. } = change {
+                        assert_eq!(end.reason, crate::protocol::tree_stream::wire::EndReason::Absent, "the stream ended: {event:?}");
+                    }
+                }
+                if let Some(value) = client.value("/sessions/burst") {
+                    replica.doc = document("session/burst", value).unwrap();
+                    replica.rev = client.version("/sessions/burst");
+                    ops.push(replica.live()["op"].clone());
+                }
             }
-            let mut replica = Replica::default();
+            let mut client = Client::following(&["/sessions/burst"]);
+            let mut replica = Document::default();
             let mut ops = Vec::new();
             let mut subscription = None;
             if exit_mode != "exit-idle" {
@@ -6152,11 +6168,7 @@ mod tests {
                 let (reply, subscribed) = oneshot::channel();
                 commands
                     .send(BridgeInput::Subscribe {
-                        scopes: vec![crate::protocol::subscription::Subscribed {
-                            scope: scope.clone(),
-                            have: None,
-                            cwd: Some(cwd.into()),
-                        }],
+                        query: stream_query(&[("session/burst", Some(cwd))]),
                         reply,
                     })
                     .unwrap();
@@ -6165,7 +6177,7 @@ mod tests {
                     && replica.live()["op"]["status"] == "completed")
                 {
                     let event = stream.next().await.expect("the stream closed");
-                    apply(&mut replica, &mut ops, event);
+                    apply(&mut client, &mut replica, &mut ops, event);
                 }
                 let expect = replica.live()["op"]["id"].as_str().unwrap().to_string();
                 let (reply, admitted) = oneshot::channel();
@@ -6200,13 +6212,13 @@ mod tests {
                             break;
                         }
                         event = stream.next() => match event {
-                            Some(event) => apply(&mut replica, &mut ops, event),
+                            Some(event) => apply(&mut client, &mut replica, &mut ops, event),
                             None => break,
                         },
                     }
                 }
                 while let Some(event) = stream.try_next() {
-                    apply(&mut replica, &mut ops, event);
+                    apply(&mut client, &mut replica, &mut ops, event);
                 }
             }
             if !bridge.is_finished() {
@@ -6263,10 +6275,22 @@ mod tests {
         result.expect("clean EOF left the bridge running");
     }
 
-    /// One v2 stream of a real bridge connection, read as a browser reads it.
+    fn stream_query(scopes: &[(&str, Option<&str>)]) -> crate::protocol::tree_stream::params::StreamQuery {
+        use crate::protocol::tree_stream::{documents::path_of, params::{Follow, StreamQuery}};
+        StreamQuery {
+            follow: scopes.iter().map(|(scope, _)| Follow { path: path_of(scope), have: None, window: None }).collect(),
+            cwd: scopes.iter().filter_map(|(scope, cwd)| {
+                scope.strip_prefix("session/").zip(*cwd).map(|(id, cwd)| (id.to_string(), cwd.to_string()))
+            }).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// One R4 stream of a real bridge connection, read as a browser reads it.
     pub(super) struct V2Stream {
-        stream: crate::protocol::feed::FeedSubscription,
-        replicas: HashMap<String, crate::protocol::replica::Replica>,
+        stream: crate::protocol::feed::TreeSubscription,
+        client: crate::protocol::tree_stream::client::Client,
+        replicas: HashMap<String, crate::protocol::tree_stream::documents::Document>,
     }
 
     impl V2Stream {
@@ -6275,37 +6299,34 @@ mod tests {
             scopes: &[(&str, Option<&str>)],
         ) -> Self {
             let (reply, subscribed) = oneshot::channel();
-            commands
-                .send(BridgeInput::Subscribe {
-                    scopes: scopes
-                        .iter()
-                        .map(|(scope, cwd)| crate::protocol::subscription::Subscribed {
-                            scope: OpScope::parse(scope).unwrap(),
-                            have: None,
-                            cwd: cwd.map(String::from),
-                        })
-                        .collect(),
-                    reply,
-                })
-                .unwrap();
-            Self {
-                stream: subscribed.await.unwrap(),
-                replicas: HashMap::new(),
-            }
+            let query = stream_query(scopes);
+            let client = crate::protocol::tree_stream::client::Client::following(
+                &query.follow.iter().map(|follow| follow.path.as_str()).collect::<Vec<_>>(),
+            );
+            commands.send(BridgeInput::Subscribe { query, reply }).unwrap();
+            Self { stream: subscribed.await.unwrap(), client, replicas: HashMap::new() }
         }
 
         pub(super) async fn next(&mut self) {
+            use crate::protocol::tree_stream::{documents::{Document, document, scope_of}, wire::{Change, EndReason}};
             let event = tokio::time::timeout(Duration::from_secs(10), self.stream.next())
                 .await
                 .expect("timed out waiting for a stream event")
                 .expect("the stream closed");
-            let event = serde_json::to_value(event).unwrap();
-            assert!(event.get("end").is_none(), "the stream ended: {event}");
-            self.replicas
-                .entry(event["scope"].as_str().unwrap().to_string())
-                .or_default()
-                .apply(&event)
-                .unwrap();
+            self.client.apply(&event).unwrap();
+            for change in event.changes.iter().flatten() {
+                if let Change::End { end, .. } = change {
+                    assert_eq!(end.reason, EndReason::Absent, "the stream ended: {event:?}");
+                }
+            }
+            self.replicas.clear();
+            for (path, held) in &self.client.paths {
+                if let Some(scope) = scope_of(path)
+                    && let Some(doc) = held.value.as_ref().and_then(|value| document(&scope, value))
+                {
+                    self.replicas.insert(scope, Document { doc, rev: held.version });
+                }
+            }
         }
 
         pub(super) async fn until(&mut self, condition: impl Fn(&Self) -> bool) {

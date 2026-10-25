@@ -7,12 +7,11 @@ This document owns implementation structure, migration order and test gates.
 The [ACP source matrix](acp-bridge-matrix.md) defines the first-layer functionality
 and retained-memory scope. Source coverage is not evidence of completed behavior.
 
-Status: the experimental baseline is `experiment/protocol-v2`. Revision 3 of the
-protocol is the target and its implementation is in progress; §7.5 records what is
-merged. Stable `main` remains v1 at `v0.3.0-rc.5`. Section 7 records current work: complete ACP behavior
-and authoritative memory first, then finish client synchronization, verification
-and repair. Sections 1–4 identify reusable implementation, not proof that the
-baseline meets either milestone. Lifecycle/concurrency work follows the
+Status: the experimental baseline is `experiment/protocol-v2`. Revision 4 is the
+current wire and the bridge's only publisher; §7.5 records its implementation and
+retirement of the revision 3 publisher (#222). Earlier migration steps below are
+historical requirements, not additional state machines to retain. The current
+contract is [protocol.md](protocol.md). Lifecycle/concurrency work follows the
 [TDD ledger](bridge-state-machine-tdd.md).
 
 ## 1. Starting point
@@ -27,8 +26,8 @@ parallel bridge or restore the removed public owner/intent/request-history model
 | Session ownership | `src/session_registry.rs`, `src/session_state.rs`, `src/session_resources.rs` | One installed entry; business state and non-cloneable resources share its lifetime |
 | Load candidate | `src/history_cache.rs`, `src/history_replay.rs` | Private attempt-local replay; replace installed history only on successful completion |
 | Control reduction | `src/protocol/controls.rs` | Preserve ordering; extend source metadata in step 18 |
-| Publication and generic diff | `src/bridge/publication.rs`, `src/protocol/project.rs`, `src/protocol/publish.rs`, `src/protocol/diff.rs` | Commit, pure projection and incremental delivery |
-| Subscription Hub | `src/protocol/hub.rs`, `src/bridge/streams.rs` | Atomic cut, queue coalescing and delivery |
+| Publication and generic diff | `src/bridge/publication.rs`, `src/protocol/project.rs`, `src/protocol/feed.rs`, `src/protocol/tree_doc.rs`, `src/protocol/tree.rs`, `src/protocol/diff.rs` | Commit, pure projection and incremental delivery |
+| Path subscriptions | `src/protocol/tree_stream/subscriber.rs`, `src/bridge/streams.rs` | Atomic cut, queue coalescing and delivery |
 | Generated types | `src/protocol/typescript.rs`, `shared/protocol.ts` | Keep Rust DTOs and browser types aligned |
 
 The full completed migration and abandoned-draft details are linked in §5 rather
@@ -566,7 +565,24 @@ starts without it; no code.
 | 7 — the browser | the tree replica, stream client and scope documents in `shared/`; writes to targets; the thread projected by the published turns; revision 3's TypeScript and its HTTP surface removed; the protocol document rewritten (#210) |
 | 8 — the reference client | windows in the TypeScript replica (hash, request), a minimal device client on a stream and by polling, scenarios S1–S5 against a real server with the figures of a window (#211) |
 
-The internal revision 3 publisher (the engine and the per-scope feed) remains in the bridge as the source of admission (`live` of a scope) and attachments; it serves no endpoint and is to be folded into the tree.
+**Single publisher (#222).** Each `Feed::commit_ending` now projects into the revision 4
+`Tree` once. Admission, controls and cancellation read only the committed target head,
+Agent capabilities and interaction children under the feed lock; they never rebuild a
+whole session. Waiting loads and attachment-read existence checks consult that tree too.
+`Projector` caches each unchanged entry and holds a per-session attachment index. Replacing
+or removing an entry releases its references, and releasing a session drops its index;
+the retained timeline remains the source of its content. Failed load candidates cannot
+replace the installed index.
+
+The revision 3 `Engine`, `live_doc`, `TimelineDoc`, subscriber queues and test replica
+have been removed. The digest primitives and checkpoint pacer remain shared by revision 4.
+The scripted-Agent gate consumes actual R4 events through the R4 client and compares
+native node values after each tree commit; its scope-shaped documents are read-only
+assertion views. Existing prompt/lifecycle assertions, missed-commit detection and
+concurrent subscriber convergence remain. Consumer migration is validated on CI before
+the old publisher is removed. The opt-in [benchmark](testing.md) compares the complete
+production feed commit with `ab4f0c5` on one runner, including the former duplicate
+publication cost, with and without a windowed output subscriber.
 
 A self-review of the whole implementation, with what it found, fixed and did not cover, is in
 [self-review.md](self-review.md).

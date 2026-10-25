@@ -30,7 +30,7 @@ use crate::options::{Options, normalize_origin};
 use crate::protocol::admission::{self, OpWrite};
 use crate::protocol::documents::{ErrorCode, ProtocolError, Scope};
 use crate::protocol::publication::Publication;
-use crate::protocol::subscription::HEARTBEAT;
+use crate::protocol::tree_stream::HEARTBEAT;
 use crate::protocol::wire;
 
 const BRIDGE_SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(5);
@@ -1566,8 +1566,8 @@ mod tests {
     async fn shutdown_closes_event_streams_without_an_active_agent() {
         let hub = test_hub();
         let follow =
-            crate::protocol::subscription::parse_stream_query("scope=global").unwrap();
-        let subscription = hub.publication.lock().feed.subscribe(&follow);
+            crate::protocol::tree_stream::params::parse_stream_query("follow=/global").unwrap();
+        let subscription = hub.publication.lock().feed.subscribe_tree(&follow);
         hub.shutdown().await;
         tokio::time::timeout(Duration::from_millis(100), async {
             while subscription.next().await.is_some() {}
@@ -1575,7 +1575,7 @@ mod tests {
         .await
         .expect("shutdown must close every SSE source before HTTP draining");
         // A stream opened after the shutdown has nothing to follow.
-        let late = hub.publication.lock().feed.subscribe(&follow);
+        let late = hub.publication.lock().feed.subscribe_tree(&follow);
         assert!(late.next().await.is_none());
     }
 

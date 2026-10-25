@@ -12,7 +12,7 @@ use super::super::views::{self, Gone, View};
 use super::params::{StreamQuery, session_of};
 use super::snapshot::snapshot_windowed;
 use super::windowed_ops::windowed;
-use super::super::subscription::QUEUE_BUDGET;
+use super::QUEUE_BUDGET;
 use super::wire::{Change, Check, End, EndReason, Event};
 
 /// A queued event and the bytes it counts against the budget.

@@ -150,7 +150,7 @@ jobs:
         with:
           name: web-client
           path: dist/client
-      - name: Compare publication costs with the original protocol implementation
+      - name: Compare complete Feed publication costs before and after R3 removal
         run: python3 scripts/protocol-benchmark.py
       - name: Upload protocol benchmark evidence
         if: always()

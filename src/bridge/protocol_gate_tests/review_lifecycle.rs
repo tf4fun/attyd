@@ -422,8 +422,7 @@ async fn review_filesystem_setup_failure_publishes_final_agent_error() {
         .publication
         .lock()
         .feed
-        .live(&crate::protocol::documents::Scope::Global)
-        .expect("initial global published");
+        .with_tree(|tree| tree.get("/global").expect("initial global published").to_value());
     let agent = &global["agent"];
     assert_eq!(
         agent["phase"], "error",
