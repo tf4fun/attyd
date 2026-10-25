@@ -639,7 +639,93 @@ describe("workspace, read side", () => {
       await settle();
       expect(posts).toHaveLength(1);
     });
+
+    it(`waits for the stream's origin when a completed ${kind} GET arrives before its stream result`, async () => {
+      respond = () => LOST;
+      const scope = kind === "create" ? "global" : "session/s1";
+      const target = kind === "create" ? "global" : "sessions/s1";
+      let admission!: ReturnType<TreeBridge["snapshot"]>;
+      let record!: RecordedOperation;
+      read = (url) => {
+        if (!url.startsWith(`/api/v2/targets/${target}/ops/`)) return undefined;
+        const running = { id: posts[0].body.id!, after: posts[0].body.expect, kind, status: "running" };
+        admission = bridge.snapshot(scope, creationBody(kind, running, []));
+        const completed = { ...running, status: "completed" };
+        record = { ...completed, rev: admission.rev };
+        bridge.snapshot(scope, creationBody(kind, completed, [record]));
+        return { status: 200, body: { outcome: "admitted", record } };
+      };
+      await startCreation(kind);
+      // The completed GET arrived, but the stream still shows the original expect.
+      expect(hook.state.sessionTransition).toBeDefined();
+      expect(creationErrors(kind)).toBe("");
+      await act(async () => current().onmessage?.({ data: JSON.stringify(admission) }));
+      await settle();
+      // Even reaching record.rev only proves admission; it does not prove a missing origin.
+      expect(hook.state.sessionTransition).toBeDefined();
+      expect(creationErrors(kind)).toBe("");
+
+      const sessions = { ...held, result: { ...held.s1, sessionId: "result", origin: record.id } };
+      const { rev: _rev, ...completed } = record;
+      const globalCut = bridge.snapshot("global", kind === "create"
+        ? { ...creationBody(kind, completed, [record]), live: globalLive({ op: op("global", completed), sessions }) }
+        : { live: globalLive({ sessions }) });
+      const sourceCut = kind === "fork" ? bridge.snapshot(scope, creationBody(kind, completed, [record])) : undefined;
+      await act(async () => current().onmessage?.({ data: JSON.stringify({
+        instance: bridge.instance, rev: sourceCut?.rev ?? globalCut.rev,
+        changes: [...globalCut.changes!, ...(sourceCut?.changes ?? [])],
+      }) }));
+      await settle();
+      expect(window.location.pathname).toMatch(/\/sessions\/result$/u);
+      expect(hook.state.sessionTransition).toBeUndefined();
+      expect(creationErrors(kind)).toBe("");
+      expect(posts).toHaveLength(1);
+    });
+
+    for (const status of ["cancelled", "completed"] as const) {
+      it(`settles a retained ${status} ${kind} without a held origin or a duplicate request`, async () => {
+        const sent = await startCreation(kind);
+        const route = window.location.pathname;
+        const laterKind = kind === "create" ? "authenticate" : "prompt";
+        const later = { id: "later-2", after: "later-1", kind: laterKind, status: "completed" };
+        const records = missedOperations(kind, [
+          { id: sent.body.id!, after: sent.body.expect, kind, status },
+          { id: "later-1", after: sent.body.id!, kind: laterKind, status: "completed" },
+          later,
+        ]);
+        await emit(snapshot(kind === "create" ? "global" : "session/s1", creationBody(kind, later, records)));
+        expect(hook.state.sessionTransition).toBeUndefined();
+        expect(window.location.pathname).toBe(route);
+        if (status === "cancelled") expect(creationErrors(kind)).toMatch(/cancel/iu);
+        else {
+          expect(creationErrors(kind)).toMatch(/accept|admit/iu);
+          expect(creationErrors(kind)).toMatch(/unknown|unavailable|cannot|could not|no longer/iu);
+        }
+        expect(posts).toHaveLength(1);
+      });
+    }
   }
+
+  it("keeps admission learned after a lost response when the fork source is later released", async () => {
+    respond = () => LOST;
+    read = (url) => {
+      if (!url.startsWith("/api/v2/targets/sessions/s1/ops/")) return undefined;
+      const running = { id: posts[0].body.id!, after: posts[0].body.expect, kind: "fork", status: "running" };
+      const rev = bridge.snapshot("session/s1", creationBody("fork", running, [])).rev;
+      return { status: 200, body: { outcome: "admitted", record: { ...running, rev } } };
+    };
+    await startCreation("fork");
+    expect(hook.state.sessionTransition?.kind).toBe("fork");
+    expect(creationErrors("fork")).toBe("");
+    const reopened = { id: "reopened", after: null, kind: "open", status: "completed" };
+    // Admission stayed out of the stream. A later cut holds a new session.
+    const heldSince = bridge.snapshot("session/s1", creationBody("fork", reopened, [])).rev;
+    await emit(snapshot("session/s1", { ...creationBody("fork", reopened, [], heldSince), historyRev: heldSince }));
+    expect(hook.state.sessionTransition).toBeUndefined();
+    expect(creationErrors("fork")).toMatch(/accept|admit/iu);
+    expect(creationErrors("fork")).not.toMatch(/may have taken effect/iu);
+    expect(posts).toHaveLength(1);
+  });
 
   for (const reason of ["expired", "released", "restarted"] as const) {
     it(`keeps an accepted request accepted when its result becomes ${reason}, without resending it`, async () => {

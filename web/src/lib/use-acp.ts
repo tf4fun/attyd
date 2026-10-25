@@ -18,18 +18,19 @@ import type {
   PromptBlock,
 } from "../../../shared/protocol";
 import type { CatalogLive3, GlobalLive3, SessionBody, SessionLive3, ShownOp } from "../../../shared/documents";
-import { ScopeFeed, type Follow } from "../../../shared/scope-feed";
+import { ScopeFeed, operationOf, type Follow } from "../../../shared/scope-feed";
 import { TreeFeedClient, type StreamSource } from "../../../shared/tree-feed";
 import { WriteQueue, type HttpFetch } from "../../../shared/protocol-client";
 import {
   ActionsClient,
   OpsClient,
   type ActionOutcome,
+  type OperationOutcome,
   type StartingWrite,
   type Write,
   type WriteOutcome,
 } from "../../../shared/write-client";
-import { originOf, type Resolution } from "../../../shared/write-resolution";
+import { originOf } from "../../../shared/write-resolution";
 import { createAttachmentReader, type AttachmentReader } from "./attachments";
 import { projectEntries } from "./entry-projection";
 import { projectPath, readProjectCwdFromPath, readSessionIdFromPath, sessionPath } from "./session-route";
@@ -72,16 +73,15 @@ export interface QueueEntry {
 /** A create or fork this page started, until the document shows what became of it. */
 interface Intent {
   kind: "new" | "fork";
-  /** The scope the operation was written to. */
-  scope: string;
-  /** The id the operation was written with. */
-  id: string;
-  /** Present when the answer was lost: the write to resolve from the document. */
-  lost?: Write;
-  /** What the bridge's document of the scope, read after the answer was lost, says of it. */
-  read?: Resolution;
+  /** The original request, including the instance and held version it was sent against. */
+  write: Write;
+  /** Once admission is known, losing its retained result cannot undo that fact. */
+  accepted: boolean;
+  /** The HTTP outcome after a lost answer; null means the read itself failed. */
+  read?: OperationOutcome | null;
   navigation: number;
   cwd: string;
+  transition: { kind: "new" | "fork"; navigation: number };
 }
 
 /** What the page remembers of listing the catalog; the pages themselves are in the document. */
@@ -511,44 +511,60 @@ export class Workspace {
     const global = this.#global();
     if (global == null) return;
     for (const intent of [...this.#intents]) {
-      if (intent.lost != null) {
-        // The replica may not have the commit that admitted it yet: only what it shows
-        // admitted is settled from it; anything else waits for the bridge's document.
-        const resolution = this.#ops.resolve(intent.lost) === "admitted" || originOf(global.sessions ?? {}, intent.id) != null
-          ? "admitted"
-          : intent.read;
-        if (resolution === undefined) continue;
-        if (resolution !== "admitted") {
-          // Not admitted, or not knowable: the user decides (C3).
-          this.#finishIntent(intent);
-          this.#reportMessage(intent.kind === "new" ? "create" : "fork", i18n.t("errors.uncertainWrite", {
-            operation: intent.kind === "new" ? "create" : "fork",
-          }), intent);
-          continue;
-        }
-        intent.lost = undefined;
-      }
-      const shownOp = bodyLive(this.#feed.get(intent.scope))?.op;
-      const op = shownOp?.id === intent.id ? shownOp : undefined;
-      const origin = originOf(global.sessions ?? {}, intent.id);
-      if (op?.status === "running") continue;
-      if (op?.status === "completed" || origin != null) {
-        const sessionId = origin ?? (isRecord(op?.result) && typeof op.result.sessionId === "string" ? op.result.sessionId : undefined);
+      if (intent.navigation !== this.#navigation) {
         this.#finishIntent(intent);
-        if (sessionId != null && this.#navigation === intent.navigation) {
-          this.#navigate({ kind: "session", sessionId, cwd: intent.cwd });
-        }
-      } else if (op != null) {
-        // Failed or cancelled.
+        continue;
+      }
+      const { write } = intent;
+      const label = intent.kind === "new" ? "create" : "fork";
+      const held = this.#feed.get(write.scope);
+      const local = this.#ops.outcome(write);
+      const localRecord = local?.outcome === "admitted" ? local.record : undefined;
+      const readRecord = intent.read?.outcome === "admitted" ? intent.read.record : undefined;
+      // A terminal GET can be ahead of a running stream record; status never goes backwards.
+      const record = readRecord != null && readRecord.status !== "running" ? readRecord : localRecord ?? readRecord;
+      const shownOp = bodyLive(held)?.op;
+      const current = shownOp?.id === write.id && shownOp.scope === write.scope ? shownOp : undefined;
+      const op = current != null && (current.status !== "running" || record == null || record.status === "running")
+        ? current
+        : record == null ? undefined : operationOf({ ...record, scope: write.scope }, undefined) as ShownOp;
+      const origin = originOf(global.sessions ?? {}, write.id);
+      const sessionId = origin ?? (op?.status === "completed" && isRecord(op.result) && typeof op.result.sessionId === "string"
+        ? op.result.sessionId : undefined);
+      if (sessionId != null) {
+        this.#finishIntent(intent);
+        this.#navigate({ kind: "session", sessionId, cwd: intent.cwd });
+        continue;
+      }
+      if (op != null || local?.outcome === "admitted" || intent.read?.outcome === "admitted") intent.accepted = true;
+      if (op?.status === "failed" || op?.status === "cancelled") {
         this.#finishIntent(intent);
         if (needsAuthentication(op.error)) this.#authRequired = true;
-        if (this.#navigation === intent.navigation && op.error != null) {
-          this.#errors = [...this.#errors, operationError(`local:${(this.#nextId += 1)}`, op as never, op.error)];
-        }
-      } else if (shownOp != null && shownOp.scope === intent.scope && shownOp.after === intent.id) {
-        // Our operation was replaced before the page saw it end, and no held session names it.
-        // (An op the document does not show yet is waited for: the 202 comes before it.)
+        const fallback = i18n.t(op.status === "failed" ? "errors.operationFailed" : "errors.operationCancelled", { operation: label });
+        const item = operationError(`local:${(this.#nextId += 1)}`, op, op.error ?? { code: "unavailable", message: fallback });
+        this.#errors = [...this.#errors, { ...item, message: item.message || fallback }];
+        continue;
+      }
+      if (!intent.accepted) {
+        // A lagging stream cannot disprove admission. Wait for the read made after HTTP failed.
+        if (intent.read === undefined) continue;
         this.#finishIntent(intent);
+        this.#reportMessage(label, i18n.t("errors.uncertainWrite", { operation: label }), intent);
+        continue;
+      }
+      const invalidated = (write.instance !== undefined && this.#feed.get(GLOBAL)?.epoch !== write.instance) ||
+        this.#feed.endOf(write.scope) !== undefined ||
+        (local?.outcome === "unknown" && local.reason !== "expired");
+      // Before the GET's admission revision arrives, a missing stream record is only lag.
+      const behindRead = readRecord != null && held != null && held.rev < readRecord.rev;
+      const retained = current != null || local?.outcome === "admitted";
+      const forgotten = !retained && !behindRead && (local?.outcome === "unknown" || local?.outcome === "superseded");
+      // A completed GET has no result, and its rev is admission, not completion. Only a
+      // terminal stream cut can establish that global has no origin for the completed write.
+      const completedInStream = current?.status === "completed" || localRecord?.status === "completed";
+      if (completedInStream || invalidated || forgotten) {
+        this.#finishIntent(intent);
+        this.#reportMessage(label, i18n.t("errors.acceptedResultUnknown", { operation: label }), intent);
       }
     }
   }
@@ -583,7 +599,7 @@ export class Workspace {
   #finishIntent(intent: Intent): void {
     const index = this.#intents.indexOf(intent);
     if (index >= 0) this.#intents.splice(index, 1);
-    this.#transition = undefined;
+    if (this.#transition === intent.transition) this.#transition = undefined;
   }
 
   #resolveRoute(): void {
@@ -621,6 +637,7 @@ export class Workspace {
       return;
     }
     this.#navigation += 1;
+    this.#transition = undefined;
     this.#errors = [];
     const previousScope = previous.kind === "session" ? `session/${previous.sessionId}` : undefined;
     if (previousScope != null && (route.kind !== "session" || `session/${route.sessionId}` !== previousScope)) {
@@ -717,17 +734,18 @@ export class Workspace {
   #start(kind: Intent["kind"], scope: string, write: StartingWrite, cwd: string): void {
     const navigation = this.#navigation;
     const label = kind === "new" ? "create" : "fork";
-    this.#transition = { kind, navigation };
+    const transition = this.#transition = { kind, navigation };
     void this.#ops.write(scope, write).then((outcome) => {
-      if (outcome.kind === "accepted") {
-        this.#intents.push({ kind, scope, id: outcome.op, navigation, cwd });
+      if (navigation !== this.#navigation) return;
+      if (outcome.kind === "accepted" && outcome.write != null) {
+        this.#intents.push({ kind, write: outcome.write, accepted: true, navigation, cwd, transition });
         if (scope === GLOBAL) this.#mine.add(outcome.op);
       } else if (outcome.kind === "uncertain" && outcome.write != null) {
-        const intent: Intent = { kind, scope, id: outcome.write.id, lost: outcome.write, navigation, cwd };
+        const intent: Intent = { kind, write: outcome.write, accepted: false, navigation, cwd, transition };
         this.#intents.push(intent);
         this.#readLost(intent, outcome.write);
       } else {
-        this.#transition = undefined;
+        if (this.#transition === transition) this.#transition = undefined;
         if (this.#navigation === navigation) this.#report(label, outcome);
       }
       this.#changed();
@@ -744,8 +762,8 @@ export class Workspace {
     const ops = this.#ops;
     void readJson(ops.resolutionUrl(write))
       .then(
-        (body) => ops.resolveFrom(write, body),
-        (): Resolution => "unknown",
+        (body) => ops.outcomeFrom(write, body) ?? null,
+        () => null,
       )
       .then((resolution) => {
         intent.read = resolution;
