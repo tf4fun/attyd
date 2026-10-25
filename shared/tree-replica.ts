@@ -339,6 +339,10 @@ export class TreeReplicaSet {
         next.delete(change.path);
         ended.set(change.path, result.end);
         changed.push(change.path);
+      } else if ("snapshot" in change && next.has(change.path)) {
+        // The stream is aligned with a path whose replica was already current: nothing to install,
+        // but the page waits to be told that the path is followed again.
+        changed.push(change.path);
       }
     }
     for (const check of event.check ?? []) {

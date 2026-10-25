@@ -139,8 +139,13 @@ describe("a tree replica", () => {
     const { set, stream } = open();
     const value = [entry("a")];
     set.receive(stream, event([snapshot(PATH, value, 5)], 100, "I"));
-    expect(set.receive(stream, event([snapshot(PATH, value, 5, 5, { same: true })], 101)).kind).toBe("ignored");
-    expect(set.get(PATH)!.value).toBe(set.get(PATH)!.value);
+    const held = set.get(PATH)!.value;
+    // Nothing to install, but the path is aligned with the stream again: its listeners are told.
+    expect(set.receive(stream, event([snapshot(PATH, value, 5, 5, { same: true })], 101))).toEqual({
+      kind: "applied",
+      changed: [PATH],
+    });
+    expect(set.get(PATH)!.value).toBe(held);
     const stale = snapshot(PATH, [entry("a"), entry("x")], 9, 4, { l: 2, c: { "1": { v: entry("x") } } });
     expect(set.receive(stream, event([stale], 102)).kind).toBe("resubscribe");
     expect(set.lastResubscribe).toMatchObject({ full: false });
