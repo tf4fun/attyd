@@ -1,16 +1,9 @@
 // The window of a text as the bridge sends it (docs/protocol.md §5.4), for the cases of a client
 // that holds text as windows: the shortest run of whole trailing segments of at least `bytes`.
-import { segments, chainStep, ZERO } from "../../shared/tree-hash";
+import { segments, chainStep, ZERO, type TextWindow } from "../../shared/tree-hash";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
-
-export interface TextWindow {
-  length: number;
-  offset: number;
-  before: string;
-  text: string;
-}
 
 /** The window of `text` for `bytes = N`. */
 export function windowOf(text: string, bytes: number): TextWindow {

@@ -87,18 +87,52 @@ export function windowHash(before: Hash, length: number, text: string): Hash {
 /** Where a value node keeps its text positions (§4.6). */
 export type TextRule = "none" | "entry" | "terminal" | "outputView";
 
-function isTextBlock(block: unknown): block is { type: "text"; text: string } {
+/** A text position held as a window (docs/protocol.md §5.4). */
+export interface TextWindow {
+  readonly length: number;
+  readonly offset: number;
+  /** The chain state before the window's first segment: 32 bytes, unpadded base64url. */
+  readonly before: string;
+  readonly text: string;
+}
+
+export function isTextWindow(value: unknown): value is TextWindow {
+  if (typeof value !== "object" || value === null) return false;
+  const window = value as Record<string, unknown>;
+  return (
+    Number.isInteger(window.length) &&
+    Number.isInteger(window.offset) &&
+    typeof window.before === "string" &&
+    typeof window.text === "string"
+  );
+}
+
+function fromBase64url(text: string): Uint8Array {
+  const binary = atob(text.replace(/-/g, "+").replace(/_/g, "/"));
+  return Uint8Array.from(binary, (char) => char.charCodeAt(0));
+}
+
+/** The hash of the text a text position holds, whole or as a window. */
+function positionHash(held: unknown): Hash {
+  if (typeof held === "string") return textHash(held);
+  const window = held as TextWindow;
+  const before = fromBase64url(window.before);
+  if (before.length !== 32) throw new Error("the chain state of a window is not 32 bytes");
+  return windowHash(before, window.length, window.text);
+}
+
+function isTextBlock(block: unknown): block is { type: "text"; text: string | TextWindow } {
   return (
     typeof block === "object" &&
     block !== null &&
     (block as { type?: unknown }).type === "text" &&
-    typeof (block as { text?: unknown }).text === "string"
+    (typeof (block as { text?: unknown }).text === "string" || isTextWindow((block as { text?: unknown }).text))
   );
 }
 
 /** Replaces `holder[key]` by the placeholder of its chain hash. */
 function replaceText(holder: Record<string, unknown>): void {
-  holder.text = `#${base64url(textHash(holder.text as string))}`;
+  holder.text = `#${base64url(positionHash(holder.text))}`;
 }
 
 function base64url(hash: Uint8Array): string {
@@ -118,9 +152,9 @@ function withTextHashes(rule: TextRule, value: unknown): unknown {
     }
   };
   if (rule === "terminal") {
-    if (typeof copy.output === "string") copy.output = `#${base64url(textHash(copy.output))}`;
+    if (typeof copy.output === "string" || isTextWindow(copy.output)) copy.output = `#${base64url(positionHash(copy.output))}`;
   } else if (rule === "outputView") {
-    if (typeof copy.text === "string") copy.text = `#${base64url(textHash(copy.text))}`;
+    if (typeof copy.text === "string" || isTextWindow(copy.text)) copy.text = `#${base64url(positionHash(copy.text))}`;
   } else if (copy.kind === "message") {
     blocks(copy.chunks, "content");
   } else if (copy.kind === "compaction") {
