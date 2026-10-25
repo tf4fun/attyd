@@ -544,6 +544,21 @@ fn a_prompt_belongs_to_the_turn_its_entry_starts() {
     );
 }
 
+#[test]
+fn every_turn_of_a_long_session_finds_its_prompt() {
+    let mut timeline = Timeline::default();
+    for n in 0..2000 {
+        timeline.begin_prompt(&[text(&format!("q{n}"))]);
+        timeline.reduce(&agent("x", None), None);
+        timeline.end_prompt(PromptEnd::Response(json!({ "stopReason": "end_turn" })));
+    }
+    let turns = timeline.turns();
+    assert_eq!(turns.len(), 2000);
+    for (n, turn) in turns.iter().enumerate() {
+        assert_eq!((turn.start, turn.end, turn.prompt), (2 * n, 2 * n + 2, Some(n)));
+    }
+}
+
 // --- Live and replay build the same structure (§4.3) ------------------------------
 
 /// What the Agent streams for one prompt, as both a live run and a replay see it.

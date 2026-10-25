@@ -300,7 +300,12 @@ impl Timeline {
         if starts.first() != Some(&0) && !self.entries.is_empty() {
             starts.insert(0, 0);
         }
-        let prompt_of = |start: usize| self.prompts.iter().position(|p| p.entry == start);
+        // The first prompt of each entry, found once: a scan per turn is quadratic in a long session.
+        let mut first_prompt: HashMap<usize, usize> = HashMap::with_capacity(self.prompts.len());
+        for (position, prompt) in self.prompts.iter().enumerate() {
+            first_prompt.entry(prompt.entry).or_insert(position);
+        }
+        let prompt_of = |start: usize| first_prompt.get(&start).copied();
         starts
             .iter()
             .enumerate()
