@@ -2107,6 +2107,15 @@ where
                     if let Some(request_id) = request_id.as_deref() {
                         let mut state = context.state.lock().await;
                         state.in_flight_request_ids.remove(request_id);
+                        if matches!(operation.as_str(), "session/set_mode" | "session/set_config_option")
+                            && let Some(session_id) = intent_session_id.as_deref()
+                            && let Ok(resources) = state.sessions.resources_mut(session_id)
+                        {
+                            // A completion releases only its own action, including
+                            // validation, send, Agent and ordered-continuation errors.
+                            resources.control_requests.remove(request_id);
+                            refresh_observer_timers(&mut state);
+                        }
                         // A closed session's scope ends with `closed`; a release ends nothing.
                         if let Some(session_id) = state.action_closes.remove(request_id)
                             && result.is_ok()
@@ -4216,7 +4225,10 @@ async fn handle_command_inner(
             let session_id = string_field(&command, "sessionId")?.to_string();
             let mode_id = string_field(&command, "modeId")?.to_string();
             {
-                let mut state = state.lock().await;
+                let state = state.lock().await;
+                if !controls::owns_request(&state, &epoch, &session_id, &request_id) {
+                    return Err(Error::request_cancelled().data("control owner retired"));
+                }
                 let session = state.sessions.active_session(&session_id).ok_or_else(|| {
                     Error::invalid_params()
                         .data(format!("unknown or inactive session: {session_id}"))
@@ -4224,35 +4236,8 @@ async fn handle_command_inner(
                 let modes = serde_json::to_value(&session.live.controls.modes)?;
                 validate_session_mode_reference((!modes.is_null()).then_some(&modes), &mode_id)
                     .map_err(semantic_error)?;
-                reserve_session_operation(
-                    &mut state,
-                    &session_id,
-                    RuntimeSessionOperationKind::SetMode,
-                    &request_id,
-                )?;
-                let epoch = state.sessions.epoch().to_string();
-                if let Err(error) = state.sessions.start_operation(
-                    &epoch,
-                    &session_id,
-                    request_id.clone(),
-                    RuntimeSessionOperationKind::SetMode,
-                    "setting_mode",
-                ) {
-                    release_session_operation(
-                        &mut state,
-                        &session_id,
-                        SessionAdmission::Control,
-                        &request_id,
-                    );
-                    return Err(runtime_state_error(error));
-                }
-                // The admitted control owns the projection now; an optional
-                // history flow parked in backoff yields instead of replaying
-                // over this control's outcome.
-                state.sessions.supersede_history_sync(&session_id);
-                refresh_observer_timers(&mut state);
             }
-            let result = send_ordered(
+            let response = send_ordered(
                 &connection,
                 ingress.as_ref(),
                 execution,
@@ -4260,73 +4245,23 @@ async fn handle_command_inner(
                 RequestClass::Control,
                 SetSessionModeRequest::new(session_id.clone(), mode_id.clone()),
             )
-            .await?;
-            let response = match result {
-                Ok(response) => response,
-                Err(error) => {
-                    let mut state = state.lock().await;
-
-                    settle_runtime_operation_request_error(
-                        &mut state,
-                        &session_id,
-                        &request_id,
-                        RuntimeSessionOperationKind::SetMode,
-                        &error,
-                    )?;
-                    release_session_operation(
-                        &mut state,
-                        &session_id,
-                        SessionAdmission::Control,
-                        &request_id,
-                    );
-                    return Err(error);
-                }
-            };
-            if let Err(error) = relay_bytes(&response) {
-                let mut state = state.lock().await;
-
-                let epoch = state.sessions.epoch().to_string();
-                state
-                    .sessions
-                    .fail_operation(
-                        &epoch,
-                        &session_id,
-                        &request_id,
-                        RuntimeSessionOperationKind::SetMode,
-                        json!({ "message": error.message.clone(), "data": error.data.clone() }),
-                    )
-                    .map_err(runtime_state_error)?;
-                release_session_operation(
-                    &mut state,
-                    &session_id,
-                    SessionAdmission::Control,
-                    &request_id,
-                );
-                return Err(error);
-            }
+            .await??;
+            relay_bytes(&response)?;
             {
                 let mut state = state.lock().await;
-
-                let epoch = state.sessions.epoch().to_string();
-                state
-                    .sessions
-                    .complete_control_operation(
-                        &epoch,
-                        &session_id,
-                        &request_id,
-                        RuntimeSessionOperationKind::SetMode,
-                        json!({
-                            "sessionUpdate": "current_mode_update",
-                            "currentModeId": mode_id,
-                        }),
-                    )
-                    .map_err(runtime_state_error)?;
-                release_session_operation(
-                    &mut state,
-                    &session_id,
-                    SessionAdmission::Control,
-                    &request_id,
-                );
+                if controls::owns_request(&state, &epoch, &session_id, &request_id) {
+                    state
+                        .sessions
+                        .update_control_state(
+                            &epoch,
+                            &session_id,
+                            json!({
+                                "sessionUpdate": "current_mode_update",
+                                "currentModeId": mode_id,
+                            }),
+                        )
+                        .map_err(runtime_state_error)?;
+                }
             }
         }
         "session/set_config_option" => {
@@ -4349,7 +4284,10 @@ async fn handle_command_inner(
                 return Err(Error::invalid_params().data("config value must be string or boolean"));
             };
             {
-                let mut state = state.lock().await;
+                let state = state.lock().await;
+                if !controls::owns_request(&state, &epoch, &session_id, &request_id) {
+                    return Err(Error::request_cancelled().data("control owner retired"));
+                }
                 let session = state.sessions.active_session(&session_id).ok_or_else(|| {
                     Error::invalid_params()
                         .data(format!("unknown or inactive session: {session_id}"))
@@ -4360,32 +4298,8 @@ async fn handle_command_inner(
                     &value,
                 )
                 .map_err(semantic_error)?;
-                reserve_session_operation(
-                    &mut state,
-                    &session_id,
-                    RuntimeSessionOperationKind::SetConfig,
-                    &request_id,
-                )?;
-                let epoch = state.sessions.epoch().to_string();
-                if let Err(error) = state.sessions.start_operation(
-                    &epoch,
-                    &session_id,
-                    request_id.clone(),
-                    RuntimeSessionOperationKind::SetConfig,
-                    "setting_config",
-                ) {
-                    release_session_operation(
-                        &mut state,
-                        &session_id,
-                        SessionAdmission::Control,
-                        &request_id,
-                    );
-                    return Err(runtime_state_error(error));
-                }
-                state.sessions.supersede_history_sync(&session_id);
-                refresh_observer_timers(&mut state);
             }
-            let result = send_ordered(
+            let response = send_ordered(
                 &connection,
                 ingress.as_ref(),
                 execution,
@@ -4393,101 +4307,29 @@ async fn handle_command_inner(
                 RequestClass::Control,
                 request,
             )
-            .await?;
-            let response = match result {
-                Ok(response) => response,
-                Err(error) => {
-                    let mut state = state.lock().await;
-
-                    settle_runtime_operation_request_error(
-                        &mut state,
-                        &session_id,
-                        &request_id,
-                        RuntimeSessionOperationKind::SetConfig,
-                        &error,
-                    )?;
-                    release_session_operation(
-                        &mut state,
-                        &session_id,
-                        SessionAdmission::Control,
-                        &request_id,
-                    );
-                    return Err(error);
-                }
-            };
-            if let Err(error) = relay_bytes(&response) {
-                let mut state = state.lock().await;
-
-                let epoch = state.sessions.epoch().to_string();
-                state
-                    .sessions
-                    .fail_operation(
-                        &epoch,
-                        &session_id,
-                        &request_id,
-                        RuntimeSessionOperationKind::SetConfig,
-                        json!({ "message": error.message.clone(), "data": error.data.clone() }),
-                    )
-                    .map_err(runtime_state_error)?;
-                release_session_operation(
-                    &mut state,
-                    &session_id,
-                    SessionAdmission::Control,
-                    &request_id,
-                );
-                return Err(error);
-            }
+            .await??;
+            relay_bytes(&response)?;
             let response_value = serde_json::to_value(&response)?;
             let config_options = response_value
                 .get("configOptions")
                 .cloned()
                 .unwrap_or_else(|| Value::Array(Vec::new()));
-            if let Err(message) = validate_session_config_options(&config_options) {
-                let error = semantic_error(message);
-                let mut state = state.lock().await;
-
-                let epoch = state.sessions.epoch().to_string();
-                state
-                    .sessions
-                    .fail_operation(
-                        &epoch,
-                        &session_id,
-                        &request_id,
-                        RuntimeSessionOperationKind::SetConfig,
-                        json!({ "message": error.message.clone(), "data": error.data.clone() }),
-                    )
-                    .map_err(runtime_state_error)?;
-                release_session_operation(
-                    &mut state,
-                    &session_id,
-                    SessionAdmission::Control,
-                    &request_id,
-                );
-                return Err(error);
-            }
+            validate_session_config_options(&config_options).map_err(semantic_error)?;
             {
                 let mut state = state.lock().await;
-
-                let epoch = state.sessions.epoch().to_string();
-                state
-                    .sessions
-                    .complete_control_operation(
-                        &epoch,
-                        &session_id,
-                        &request_id,
-                        RuntimeSessionOperationKind::SetConfig,
-                        json!({
-                            "sessionUpdate": "config_option_update",
-                            "configOptions": config_options,
-                        }),
-                    )
-                    .map_err(runtime_state_error)?;
-                release_session_operation(
-                    &mut state,
-                    &session_id,
-                    SessionAdmission::Control,
-                    &request_id,
-                );
+                if controls::owns_request(&state, &epoch, &session_id, &request_id) {
+                    state
+                        .sessions
+                        .update_control_state(
+                            &epoch,
+                            &session_id,
+                            json!({
+                                "sessionUpdate": "config_option_update",
+                                "configOptions": config_options,
+                            }),
+                        )
+                        .map_err(runtime_state_error)?;
+                }
             }
         }
         "auth/terminal_start" => {

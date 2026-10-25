@@ -310,6 +310,15 @@ async fn eof_settles_all_controls_and_the_next_connection_has_no_old_control_wor
             state.in_flight_request_ids.is_empty(),
             "EOF frees every command owner"
         );
+        assert!(
+            state
+                .sessions
+                .resources(CREATED)
+                .unwrap()
+                .control_requests
+                .is_empty(),
+            "EOF leaves no control work in the old allocation"
+        );
     }
 
     let publication = peer.handover();

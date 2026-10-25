@@ -593,6 +593,7 @@ impl SessionRegistry {
             }
         }
         for entry in self.sessions.values_mut() {
+            entry.resources.control_requests.clear();
             let timeline = entry.state.timeline.clone();
             if let Some(live) = entry.state.live.as_mut() {
                 if live.op.is_running() {
