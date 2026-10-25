@@ -257,6 +257,8 @@ function applyCheck(held: PathReplica | undefined, check: Check): Applied {
 export interface Follow {
   readonly path: string;
   readonly cwd?: string;
+  /** Hold the text positions under the path as windows of at least this many bytes (docs/protocol.md §5.4). */
+  readonly window?: number;
 }
 
 export type Received = "applied" | "ignored" | "resubscribe";
@@ -297,6 +299,9 @@ export class TreeReplicaSet {
     for (const { path } of follow) params.append("follow", path);
     if (this.#instance !== undefined) {
       for (const { path } of held) params.append("have", `${path}:${this.#replicas.get(path)!.version}`);
+    }
+    for (const { path, window } of follow) {
+      if (window !== undefined) params.append("window", `${path}:${window}`);
     }
     for (const { path, cwd } of follow) {
       const session = sessionOf(path);
