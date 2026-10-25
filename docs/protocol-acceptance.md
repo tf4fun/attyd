@@ -438,6 +438,23 @@ r2 are new or changed in revision 2; their runtime code is not migrated yet.
     catalog; an Agent error leaves the session as it was; a later subscription loads
     it again.
 
+    Close admission preserves pending elicitation (#224, P2-5). The HTTP/ACP case
+    `server::stream_tests::bench::close_interactions::a_failed_close_preserves_elicitation_until_answer_parent_end_or_successful_close`
+    inspects every outgoing message at admission: only the permission is cancelled.
+    After the Agent refuses close, both session- and request-scoped forms remain
+    answerable exactly once. A second unanswered pair proves the request form ends
+    with its parent response, while the session form ends only after a successful close.
+
+    Existing connection-end gates remain separate from that close refusal case:
+    `bridge::protocol_gate_tests::review_lifecycle::review_natural_eof_fails_global_and_catalog_with_unavailable`
+    checks natural EOF and failed operations; `bridge::protocol_gate_tests::the_connection_end_fails_running_operations_and_publishes_the_final_agent`
+    checks explicit shutdown with a pending permission and an accepted URL flow,
+    including coordinator release and final document cleanup.
+    `session_registry::tests::registry_drop_answers_outstanding_work_instead_of_dropping_senders`
+    checks explicit cancel answers for pending permission and session elicitation
+    when their resource owner drops. These gates do not claim a natural-EOF wire
+    check of both unanswered elicitation scopes.
+
 <a id="a30"></a>
 
 30. **Message identity and turns (§4.1)** r2. A replay of a user message of text and an
