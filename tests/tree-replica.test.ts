@@ -206,6 +206,69 @@ describe("a tree replica", () => {
     expect(set.lastResubscribe).toMatchObject({ full: false });
   });
 
+  for (const form of ["whole", "unchanged", "older-base differential"] as const) {
+    it(`verifies a same-version ${form} snapshot without installing it again`, () => {
+      const { set, stream } = open();
+      set.receive(stream, event([snapshot(PATH, [entry("a")], 5)], 100, "I"));
+      set.receive(stream, event([{ path: PATH, from: 5,
+        ops: [{ op: "append", path: "", values: [entry("b")] }] }], 120));
+      const held = set.get(PATH)!.value;
+      expect(set.get(PATH)).toMatchObject({ version: 120, verified: 5 });
+      const current = [entry("a"), entry("b")];
+      const base = form === "whole" ? null : form === "unchanged" ? 120 : 5;
+      const node = form === "whole" ? { v: current }
+        : form === "unchanged" ? { same: true }
+          : { l: 2, c: { "1": { v: current[1] } } };
+      const resumed = set.open([{ path: PATH }]);
+      const repeated = snapshot(PATH, current, 120, base, node);
+
+      expect(set.receive(resumed.stream, event([repeated], 130, "I"))).toEqual({
+        kind: "applied", changed: [PATH],
+      });
+      expect(set.get(PATH)).toMatchObject({ version: 120, verified: 120 });
+      expect(set.get(PATH)!.value).toBe(held);
+      // Even a delayed differential from the old base confirms what is already held;
+      // receiving it twice must neither replace that value nor append the entry twice.
+      set.receive(resumed.stream, event([repeated], 130));
+      expect(set.get(PATH)!.value).toBe(held);
+      expect(set.get(PATH)!.value).toEqual(current);
+    });
+
+    it(`asks for the whole path when a same-version ${form} snapshot has a different hash`, () => {
+      const { set, stream } = open();
+      const current = [entry("a"), entry("b")];
+      set.receive(stream, event([snapshot(PATH, current, 120)], 130, "I"));
+      const base = form === "whole" ? null : form === "unchanged" ? 120 : 5;
+      const node = form === "whole" ? { v: current }
+        : form === "unchanged" ? { same: true }
+          : { l: 2, c: { "1": { v: current[1] } } };
+      const resumed = set.open([{ path: PATH }]);
+      const wrong = snapshot(PATH, [entry("a"), entry("different")], 120, base, node);
+
+      expect(set.receive(resumed.stream, event([wrong], 130, "I"))).toEqual({
+        kind: "resubscribe", changed: [],
+      });
+      expect(set.lastResubscribe).toMatchObject({ full: true, path: PATH });
+      expect(set.get(PATH)).toBeUndefined();
+      expect(new URL(set.open([{ path: PATH }]).url, "http://x").searchParams.has("have")).toBe(false);
+    });
+  }
+
+  it("keeps a newer verified replica when an older snapshot carries a different hash", () => {
+    const { set, stream } = open();
+    set.receive(stream, event([snapshot(PATH, [entry("current")], 9)], 100, "I"));
+    const held = set.get(PATH)!;
+    const older = [entry("old")];
+    for (const change of [
+      snapshot(PATH, older, 5),
+      snapshot(PATH, older, 5, 3, { l: 1, c: { "0": { v: older[0] } } }),
+    ]) {
+      expect(set.receive(stream, event([change], 101)).kind).not.toBe("resubscribe");
+      expect(set.get(PATH)).toBe(held);
+      expect(set.get(PATH)).toMatchObject({ version: 9, verified: 9 });
+    }
+  });
+
   it("checks the hash at the version it holds, ignores an older check and takes a later one for a missed change", () => {
     const { set, stream } = open();
     const value = [entry("a")];

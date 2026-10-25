@@ -203,8 +203,12 @@ function install(path: string, held: PathReplica | undefined, snapshot: Snapshot
   if (!Number.isInteger(snapshot.at) || typeof snapshot.hash !== "string" || typeof snapshot.node !== "object") {
     return resubscribe("a malformed snapshot", true);
   }
-  // A repeat: the path is held at this version or a later one.
-  if (held !== undefined && snapshot.at <= held.version) return { kind: "unchanged" };
+  if (held !== undefined && snapshot.at < held.version) return { kind: "unchanged" };
+  // A same-version snapshot is still a checkpoint of the held value. Its node may be
+  // `same` or a differential from an older base, so verify without installing it again.
+  if (held !== undefined && snapshot.at === held.version) {
+    return applyCheck(held, { path, at: snapshot.at, hash: snapshot.hash });
+  }
   if (snapshot.base !== null && (held === undefined || snapshot.base !== held.version)) {
     return resubscribe(`a snapshot built on ${snapshot.base} of a path held at ${held?.version ?? "nothing"}`, held === undefined);
   }

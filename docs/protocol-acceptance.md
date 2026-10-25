@@ -87,6 +87,18 @@ Late session demand after EOF (#224, P1-1) is covered by
 | Global/catalog reads and streams alone do not start a connection | `late_global_and_catalog_reads_and_streams_do_not_start_a_connection` |
 | An unheld session followed without cwd ends with `load_failed` / `invalid_request`, without sending `session/load` | `a_late_session_stream_without_cwd_ends_instead_of_waiting_forever` |
 
+Same-version reconnect verification (#224, P2-1) has these client gates. A snapshot at
+the held version checks the held value and updates its verified version; it does not
+install the payload again, even when its differential `base` is older. A hash mismatch
+drops that path and requests a full snapshot without its `have`.
+
+| Boundary | Gate |
+| --- | --- |
+| Equal-version full, `same`, and older-base differential snapshots confirm the current value without replacing it or applying it twice | [tests/tree-replica.test.ts](../tests/tree-replica.test.ts): `verifies a same-version ${form} snapshot without installing it again` |
+| All three forms reject a different hash, including when the held version was already verified, and omit `have` on recovery | [tests/tree-replica.test.ts](../tests/tree-replica.test.ts): `asks for the whole path when a same-version ${form} snapshot has a different hash` |
+| Older full and differential snapshots neither roll back the value/version nor clear its verification | [tests/tree-replica.test.ts](../tests/tree-replica.test.ts): `keeps a newer verified replica when an older snapshot carries a different hash` |
+| After warming the text-chain cache, a corrupt append followed by a disconnect before the checkpoint is detected by the reconnect's `same` snapshot; a full snapshot repairs it without a later update or checkpoint | [tests/tree-feed.test.ts](../tests/tree-feed.test.ts): `repairs a corrupted append on reconnect even when no later change or checkpoint arrives` |
+
 The reference client's memory figures count UTF-8 window text, not the actual heap used
 by parsed JSON and replica copies. View polling below the 30-second `VIEW_LINGER` can
 receive `unchanged`; after eviction it receives a full snapshot again. These are the
