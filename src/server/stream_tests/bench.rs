@@ -100,7 +100,10 @@ async fn read_scope(address: SocketAddr, scope: &str) -> (StatusCode, Value) {
     client.apply(&event).unwrap();
     match client.value(&path).and_then(|value| document(scope, value)) {
         Some(doc) => (status, doc),
-        None => (StatusCode::NOT_FOUND, json!({ "error": { "code": "not_found" } })),
+        None => (
+            StatusCode::NOT_FOUND,
+            json!({ "error": { "code": "not_found", "message": format!("{scope} is not there") } }),
+        ),
     }
 }
 

@@ -307,7 +307,11 @@ impl Subscriber {
             .paths
             .iter_mut()
             .filter(|(path, state)| {
-                session_of(path).as_deref() == Some(session_id) && !state.present && !state.over && tree.get(path).is_none()
+                session_of(path).as_deref() == Some(session_id)
+                    && state.demand
+                    && !state.present
+                    && !state.over
+                    && tree.get(path).is_none()
             })
             .map(|(path, state)| {
                 state.demand = end.reason == EndReason::Absent;

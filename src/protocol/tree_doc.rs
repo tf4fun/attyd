@@ -306,6 +306,10 @@ impl Projector {
         self.sessions.get(session_id)?.attachments.get(id)
     }
 
+    pub(crate) fn has_failure(&self, session_id: &str) -> bool {
+        self.failures.iter().any(|(id, _)| id == session_id)
+    }
+
     /// A load of `session_id` failed with `error`: kept until the session is held again or
     /// deleted, among the last `LOAD_FAILURES`.
     pub(crate) fn record_failure(&mut self, session_id: &str, error: ProtocolError) {

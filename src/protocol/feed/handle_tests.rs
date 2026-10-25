@@ -101,6 +101,12 @@ async fn closing_the_feed_ends_every_subscription() {
     let late = handle.subscribe_tree(&follow("/sessions/missing"));
     assert_eq!(timeout(WAIT, late.next()).await.unwrap(), None);
     assert!(!handle.followed_sessions().contains_key("missing"));
+    let read = handle.subscribe_tree_reading(&follow("/global"));
+    let mut client = Client::following(&["/global"]);
+    client.apply(&read.next().await.expect("the final cut remains readable")).unwrap();
+    handle.with_tree(|tree| assert_eq!(client.value("/global"), tree.get("/global").map(|node| node.to_value()).as_ref()));
+    assert!(read.next().await.is_none());
+    assert!(handle.take_touched().is_empty());
 }
 
 #[tokio::test]

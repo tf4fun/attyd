@@ -194,6 +194,10 @@ async fn an_unheld_session_without_cwd_or_whose_load_fails_ends_with_load_failed
     assert_eq!(end["reason"], "load_failed");
     assert_eq!(end["error"]["code"], "agent_error");
     peer.settled().await;
+    let failure = peer.publication.lock().feed.with_tree(|tree| {
+        tree.get("/global/loadFailures/saved").expect("the failed load is recorded").to_value()
+    });
+    assert_eq!(failure["code"], "agent_error", "materialization cleanup keeps the Agent's original failure");
 }
 
 fn deletable() -> Value {

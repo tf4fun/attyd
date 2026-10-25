@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use tokio::time::timeout;
 
 use super::*;
-use crate::protocol::documents::{AgentInfo, AgentLaunch, AgentPhase, ProtocolError};
+use crate::protocol::documents::{AgentInfo, AgentLaunch, AgentPhase, ErrorCode, ProtocolError};
 use crate::protocol::tree_stream::client::Client;
 use crate::protocol::tree_stream::params::parse_stream_query;
 use crate::protocol::tree_stream::wire::Change;
@@ -201,6 +201,40 @@ fn a_failed_load_leaves_its_whole_error_in_global_and_a_stream_of_global_sees_it
     assert_eq!(kept["message"], "login required");
     assert_eq!(kept["data"]["code"], -32000);
     assert_eq!(kept["data"]["data"]["big"].as_str().unwrap().len(), 10_000);
+}
+
+#[test]
+fn a_repeated_load_cleanup_keeps_the_first_failure_until_a_new_request() {
+    let mut feed = Feed::new();
+    let registry = SessionRegistry::new("epoch");
+    feed.commit(&registry, &agent(), 1);
+    let id = feed.subscribe_tree(&query("follow=/sessions/s&cwd=s:/work"));
+    let mut client = Client::following(&["/sessions/s"]);
+    pump(&mut feed, id, &mut client);
+    feed.end_waiting("s", &failure("the Agent refused"));
+    pump(&mut feed, id, &mut client);
+    let original = feed.tree().get("/global/loadFailures/s").unwrap().to_value();
+    let rev = feed.tree().rev();
+    let cleanup = End {
+        reason: EndReason::LoadFailed,
+        error: Some(ProtocolError::new(ErrorCode::Unavailable, "cleanup of the same load")),
+    };
+    feed.end_waiting("s", &cleanup);
+    assert_eq!(feed.tree().rev(), rev);
+    assert_eq!(feed.tree().get("/global/loadFailures/s").unwrap().to_value(), original);
+    assert!(feed.next_tree(id).is_none(), "the same failure cannot end this path twice");
+
+    // Another request can fail before it ever installs a session, and replaces the cause.
+    let retry = feed.subscribe_tree(&query("follow=/sessions/s&cwd=s:/elsewhere"));
+    feed.next_tree(retry).unwrap();
+    feed.end_waiting("s", &failure("the next request failed"));
+    assert_eq!(feed.tree().get("/global/loadFailures/s").unwrap().to_value()["message"], "the next request failed");
+
+    // A real completed load attempt is recorded even if its last subscriber has gone away.
+    feed.unsubscribe(id);
+    feed.unsubscribe(retry);
+    feed.commit_ending(&registry, &agent(), 1, Instant::now(), &[("s".into(), failure("a later read failed"))]);
+    assert_eq!(feed.tree().get("/global/loadFailures/s").unwrap().to_value()["message"], "a later read failed");
 }
 
 #[test]
