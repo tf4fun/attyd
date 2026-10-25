@@ -52,24 +52,8 @@ pub(crate) fn read_segment(tree: &Tree, path: &str, index: usize, at: u64) -> Se
     // Only this position's own history counts: another position of the node, or a field beside
     // the text, changing leaves its segments as they were.
     let Some(held) = history.positions.get(&position) else { return SegmentRead::Stale };
-    if held.replaced > at {
+    if held.replaced > at || held.segments[index] > at {
         return SegmentRead::Stale;
-    }
-    let end: usize = segments[..=index].iter().map(|segment| segment.len()).sum();
-    // From `replaced` on the text only grew, and it was `floor` bytes long then: a segment within
-    // `floor` is complete at `at`, and complete segments do not change. Beyond it the lengths the
-    // node remembers tell, and a value not changed since `at` is as it was.
-    if end as u64 > held.floor && node.rev() > at {
-        let length_at = history
-            .lengths
-            .iter()
-            .rev()
-            .find(|(rev, _)| *rev <= at)
-            .and_then(|(_, lengths)| lengths.iter().find(|(pointer, _)| *pointer == position))
-            .map(|(_, length)| *length);
-        if !length_at.is_some_and(|length| length >= end as u64) {
-            return SegmentRead::Stale;
-        }
     }
     let before = segments[..index].iter().fold(ZERO, |state, segment| hash::chain_step(&state, segment));
     SegmentRead::Segment(Segment { before: state_wire(&before), segment: (*segment).to_string() })

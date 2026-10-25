@@ -11,7 +11,7 @@
 //! pointer comparison, not a walk of its JSON.
 #![cfg_attr(not(test), allow(dead_code))]
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 
 use serde_json::{Map, Value};
@@ -88,14 +88,14 @@ enum Body {
 /// How one text position of a value node has changed, to tell a segment read whether the segment
 /// it names is the one a client holds (design §7.1): earlier segments of a text never change while
 /// it only grows.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct PositionHistory {
     /// The revision at which the position was last replaced or edited other than by an append (a
     /// position new to the node counts as replaced).
     pub replaced: u64,
-    /// The length in bytes the position had then. It only grew since, so every segment that ends
-    /// within it is complete at any revision from `replaced` on.
-    pub floor: u64,
+    /// The last change to each current segment. Completed segments keep their revision however
+    /// many later appends arrive; only the last segment can grow. No old text is retained.
+    pub segments: Arc<Vec<u64>>,
 }
 
 /// How the text positions of a value node have changed.
@@ -103,13 +103,7 @@ pub(crate) struct PositionHistory {
 pub(crate) struct TextHistory {
     /// By pointer into the value.
     pub positions: BTreeMap<String, PositionHistory>,
-    /// The length in bytes of each text position, by pointer, as of the last revisions at which
-    /// the value changed: for a segment that ends beyond `floor` of a position.
-    pub lengths: VecDeque<(u64, Vec<(String, u64)>)>,
 }
-
-/// How many revisions of lengths a value node remembers.
-const LENGTH_HISTORY: usize = 8;
 
 /// A node with its revisions.
 #[derive(Debug, Clone)]
@@ -418,8 +412,7 @@ impl Node {
     }
 
     /// The text history of a value node that has just taken `value` from `before`: per text
-    /// position, whether it only grew (its text still starts with the old one) or was replaced,
-    /// and the lengths now.
+    /// position, whether it only grew and when each of its current segments last changed.
     fn text_after(
         old: Option<&TextHistory>,
         before: Option<&Value>,
@@ -431,27 +424,31 @@ impl Node {
         if pointers.is_empty() {
             return TextHistory::default();
         }
-        let mut history = TextHistory {
-            positions: BTreeMap::new(),
-            lengths: old.map(|old| old.lengths.clone()).unwrap_or_default(),
-        };
-        let mut lengths = Vec::with_capacity(pointers.len());
+        let mut history = TextHistory::default();
         for pointer in pointers {
             let now = value.pointer(&pointer).and_then(Value::as_str).unwrap_or("");
-            let grew = before
+            let was = before
                 .and_then(|before| before.pointer(&pointer))
-                .and_then(Value::as_str)
-                .is_some_and(|was| now.starts_with(was));
+                .and_then(Value::as_str);
+            let grew = was.is_some_and(|was| now.starts_with(was));
             let kept = old.and_then(|old| old.positions.get(&pointer)).filter(|_| grew);
-            history.positions.insert(
-                pointer.clone(),
-                kept.copied().unwrap_or(PositionHistory { replaced: rev, floor: now.len() as u64 }),
-            );
-            lengths.push((pointer, now.len() as u64));
-        }
-        history.lengths.push_back((rev, lengths));
-        while history.lengths.len() > LENGTH_HISTORY {
-            history.lengths.pop_front();
+            let position = if let Some(kept) = kept.filter(|_| was == Some(now)) {
+                kept.clone()
+            } else {
+                let mut prior = was.into_iter().flat_map(hash::segments);
+                let segments = hash::segments(now)
+                    .enumerate()
+                    .map(|(index, segment)| {
+                        let same = prior.next() == Some(segment);
+                        kept.filter(|_| same).map_or(rev, |kept| kept.segments[index])
+                    })
+                    .collect();
+                PositionHistory {
+                    replaced: kept.map_or(rev, |kept| kept.replaced),
+                    segments: Arc::new(segments),
+                }
+            };
+            history.positions.insert(pointer, position);
         }
         history
     }

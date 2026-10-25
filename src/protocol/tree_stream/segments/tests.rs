@@ -137,7 +137,7 @@ fn complete_segments_are_served_however_many_commits_the_text_grew_by() {
     // Segment 0 was complete at `held` and has not changed since: far more commits than the
     // lengths remembered do not matter.
     assert_eq!(segment(read(&tree, 0, held)).segment, "a".repeat(L));
-    // Segment 1 was 904 bytes at `held`; whether it was complete then is no longer known.
+    // Segment 1 was 904 bytes at `held` and grew afterward.
     assert_eq!(read(&tree, 1, held), SegmentRead::Stale);
     assert!(matches!(read(&tree, 1, tree.rev()), SegmentRead::Segment(_)));
 }
@@ -155,6 +155,42 @@ fn a_streamed_text_can_be_paged_from_the_version_a_device_holds() {
     for index in 0..3 {
         assert_eq!(segment(read(&tree, index, held)).segment.len(), L, "{index}");
     }
+}
+
+#[test]
+fn a_text_that_started_short_keeps_segments_completed_during_streaming() {
+    let mut text = "x".to_string();
+    let mut tree = Tree::new("i");
+    tree.commit(root(&text));
+    text.push_str(&"y".repeat(3 * L));
+    tree.commit(root(&text));
+    let held = tree.rev();
+    let first = segment(read(&tree, 0, held));
+    for _ in 0..40 {
+        text.push('z');
+        tree.commit(root(&text));
+    }
+    assert_eq!(segment(read(&tree, 0, held)), first);
+    for index in 1..3 {
+        assert_eq!(segment(read(&tree, index, held)).segment, "y".repeat(L));
+    }
+    assert_eq!(read(&tree, 3, held), SegmentRead::Stale, "the partial last segment grew");
+    assert!(matches!(read(&tree, 3, tree.rev()), SegmentRead::Segment(_)));
+}
+
+#[test]
+fn a_unicode_boundary_keeps_a_segment_that_the_next_codepoint_cannot_extend() {
+    let mut text = "x".repeat(L - 1);
+    let mut tree = Tree::new("i");
+    tree.commit(root(""));
+    tree.commit(root(&text));
+    let held = tree.rev();
+    for _ in 0..40 {
+        text.push('日');
+        tree.commit(root(&text));
+    }
+    assert_eq!(segment(read(&tree, 0, held)).segment, "x".repeat(L - 1));
+    assert_eq!(read(&tree, 1, held), SegmentRead::Stale, "this segment did not exist at held");
 }
 
 #[test]
