@@ -161,6 +161,43 @@ describe("a stream that fails", () => {
     expect(params(h.last().url).has("have")).toBe(false);
   });
 
+  it("repairs a corrupted append on reconnect even when no later change or checkpoint arrives", () => {
+    const h = harness();
+    const path = "/views/S/output/latest";
+    const prefix = "x".repeat(32 * 1024);
+    const output = (text: string) => ({
+      turn: { historyRev: 1, start: 0, state: "running" }, entry: 1, text, other: 0,
+    });
+    h.client.follow([{ path }]);
+    // Installing the initial snapshot warms the frozen value's text-chain cache.
+    h.last().emit({ instance: "I", rev: 10, changes: [snapshot(path, output(prefix), 3)] });
+    h.last().emit({ rev: 11, changes: [{ path, from: 3,
+      ops: [{ op: "append", path: "/text", text: "corrupted tail" }] }] });
+    expect(h.client.get(path)).toMatchObject({
+      version: 11, verified: 3, value: { text: prefix + "corrupted tail" },
+    });
+
+    // The stream breaks before its checkpoint. The next stream finds this path unchanged
+    // at the bridge, so its first snapshot is the only opportunity to check the held content.
+    h.last().fail();
+    h.runScheduled();
+    expect(params(h.last().url).getAll("have")).toEqual([`${path}:11`]);
+    const correct = output(prefix + "tail");
+    h.last().emit({ instance: "I", rev: 11, changes: [{ path, snapshot: {
+      base: 11, at: 11, hash: wire(hashAt(tokensOf(path), correct)), node: { same: true },
+    } }] });
+    expect(h.last().closed).toBe(true);
+    expect(h.client.get(path)).toBeUndefined();
+    expect(h.statuses[h.statuses.length - 1]).toMatchObject({ state: "retrying" });
+
+    h.runScheduled();
+    expect(params(h.last().url).has("have")).toBe(false);
+    h.last().emit({ instance: "I", rev: 11, changes: [snapshot(path, correct, 11)] });
+    expect(h.client.get(path)).toMatchObject({ version: 11, verified: 11, value: correct });
+    expect(h.statuses[h.statuses.length - 1]).toEqual({ state: "synchronized" });
+    expect(h.scheduled).toHaveLength(0);
+  });
+
   it("retries with a growing delay and says so, until a stream delivers again", () => {
     const h = harness();
     h.client.follow([{ path: S }]);
