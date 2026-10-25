@@ -11,7 +11,7 @@
 //! pointer comparison, not a walk of its JSON.
 #![cfg_attr(not(test), allow(dead_code))]
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 
 use serde_json::{Map, Value};
@@ -85,21 +85,25 @@ enum Body {
     List(Vec<Node>),
 }
 
-/// How the text positions of a value node have changed, to tell a segment read whether the
-/// segment it names is the one a client holds (design §7.1): earlier segments of a text never
-/// change while it only grows, and the lengths tell which segments were complete.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct TextHistory {
-    /// The revision at which a text position was last replaced or edited other than by an
-    /// append.
+/// How one text position of a value node has changed, to tell a segment read whether the segment
+/// it names is the one a client holds (design §7.1): earlier segments of a text never change while
+/// it only grows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PositionHistory {
+    /// The revision at which the position was last replaced or edited other than by an append (a
+    /// position new to the node counts as replaced).
     pub replaced: u64,
-    /// The length in bytes of each text position, by pointer, as of the last revisions at which
-    /// the value changed.
-    pub lengths: VecDeque<(u64, Vec<(String, u64)>)>,
+    /// The last change to each current segment. Completed segments keep their revision however
+    /// many later appends arrive; only the last segment can grow. No old text is retained.
+    pub segments: Arc<Vec<u64>>,
 }
 
-/// How many revisions of lengths a value node remembers.
-const LENGTH_HISTORY: usize = 8;
+/// How the text positions of a value node have changed.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TextHistory {
+    /// By pointer into the value.
+    pub positions: BTreeMap<String, PositionHistory>,
+}
 
 /// A node with its revisions.
 #[derive(Debug, Clone)]
@@ -323,13 +327,12 @@ impl Node {
                     Body::Value(old.clone(), rule)
                 }
                 Some(Body::Value(old, _)) => {
-                    let before = ops.len();
                     diff::diff(path, old, &value, &text_mode, ops);
-                    text = Node::text_after(old_text, rule, &value, path, &ops[before..], rev);
+                    text = Node::text_after(old_text, Some(old), rule, &value, rev);
                     Body::Value(value, rule)
                 }
                 _ => {
-                    text = Node::text_after(None, rule, &value, path, &[], rev);
+                    text = Node::text_after(None, None, rule, &value, rev);
                     Body::Value(value, rule)
                 }
             },
@@ -408,41 +411,44 @@ impl Node {
         Node { rev: own, srev, body, hash, text }
     }
 
-    /// The text history of a value node that has just taken `value`: whether the ops that made
-    /// it were only appends to its text positions, and the lengths now.
+    /// The text history of a value node that has just taken `value` from `before`: per text
+    /// position, whether it only grew and when each of its current segments last changed.
     fn text_after(
         old: Option<&TextHistory>,
+        before: Option<&Value>,
         rule: TextRule,
         value: &Value,
-        path: &str,
-        ops: &[Op],
         rev: u64,
     ) -> TextHistory {
-        let positions = hash::text_pointers(rule, value);
-        if positions.is_empty() {
+        let pointers = hash::text_pointers(rule, value);
+        if pointers.is_empty() {
             return TextHistory::default();
         }
-        let only_appends = !ops.is_empty()
-            && ops.iter().all(|op| match op {
-                Op::Append { path: at, tail: AppendTail::Text { .. } } => at
-                    .strip_prefix(path)
-                    .is_some_and(|pointer| positions.iter().any(|position| position == pointer)),
-                _ => false,
-            });
-        let mut history = old.cloned().unwrap_or_default();
-        if !only_appends || old.is_none() {
-            history.replaced = rev;
-        }
-        let lengths = positions
-            .iter()
-            .map(|position| {
-                let length = value.pointer(position).and_then(Value::as_str).map_or(0, str::len);
-                (position.clone(), length as u64)
-            })
-            .collect();
-        history.lengths.push_back((rev, lengths));
-        while history.lengths.len() > LENGTH_HISTORY {
-            history.lengths.pop_front();
+        let mut history = TextHistory::default();
+        for pointer in pointers {
+            let now = value.pointer(&pointer).and_then(Value::as_str).unwrap_or("");
+            let was = before
+                .and_then(|before| before.pointer(&pointer))
+                .and_then(Value::as_str);
+            let grew = was.is_some_and(|was| now.starts_with(was));
+            let kept = old.and_then(|old| old.positions.get(&pointer)).filter(|_| grew);
+            let position = if let Some(kept) = kept.filter(|_| was == Some(now)) {
+                kept.clone()
+            } else {
+                let mut prior = was.into_iter().flat_map(hash::segments);
+                let segments = hash::segments(now)
+                    .enumerate()
+                    .map(|(index, segment)| {
+                        let same = prior.next() == Some(segment);
+                        kept.filter(|_| same).map_or(rev, |kept| kept.segments[index])
+                    })
+                    .collect();
+                PositionHistory {
+                    replaced: kept.map_or(rev, |kept| kept.replaced),
+                    segments: Arc::new(segments),
+                }
+            };
+            history.positions.insert(pointer, position);
         }
         history
     }
