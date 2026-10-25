@@ -324,6 +324,14 @@ fn a_cached_output_appends_its_last_block_and_rebuilds_when_the_blocks_or_output
     world.update(chunk(2, " new block"));
     commit(&mut world, &mut cache);
     assert_eq!(world.view(LATEST)["text"], format!("{prefix}tail appended new block"));
+    world.update(json!({ "sessionUpdate": "agent_message_chunk", "messageId": "a",
+        "content": { "type": "image", "data": "eA==", "mimeType": "image/png" } }));
+    commit(&mut world, &mut cache);
+    assert_eq!(world.view(LATEST)["other"], 1, "new non-text content is not hidden by an append cache");
+    world.update(chunk(3, " after image"));
+    commit(&mut world, &mut cache);
+    assert_eq!(world.view(LATEST)["text"], format!("{prefix}tail appended new block after image"));
+    assert_eq!(world.view(LATEST)["other"], 1);
     world.update(json!({ "sessionUpdate": "tool_call", "toolCallId": "t", "title": "tool" }));
     commit(&mut world, &mut cache);
     let held = world.tree.get(LATEST).unwrap().value_arc().unwrap();

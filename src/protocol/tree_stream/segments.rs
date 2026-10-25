@@ -49,21 +49,11 @@ pub(crate) fn read_segment(tree: &Tree, path: &str, index: usize, at: u64) -> Se
     let chain = node.text_chain(&position).expect("a text chain");
     let Some((start, end, before)) = chain.segment(index) else { return SegmentRead::NotFound };
     let history = node.text_history();
-    if history.replaced > at {
+    // Only this position's own history counts: another position of the node, or a field beside
+    // the text, changing leaves its segments as they were.
+    let Some(held) = history.positions.get(&position) else { return SegmentRead::Stale };
+    if held.replaced > at || held.segments[index] > at {
         return SegmentRead::Stale;
-    }
-    if node.rev() > at {
-        // Only appended to since: the segment is as it was if it was complete at `at`.
-        let length_at = history
-            .lengths
-            .iter()
-            .rev()
-            .find(|(rev, _)| *rev <= at)
-            .and_then(|(_, lengths)| lengths.iter().find(|(held, _)| *held == position))
-            .map(|(_, length)| *length);
-        if !length_at.is_some_and(|length| length >= end as u64) {
-            return SegmentRead::Stale;
-        }
     }
     SegmentRead::Segment(Segment { before: state_wire(&before), segment: text[start..end].to_string() })
 }

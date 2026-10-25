@@ -249,20 +249,22 @@ fn same_output_head(before: &Value, after: &Value) -> bool {
 /// earlier block, a new block, an edit or a replacement uses the ordinary full projection.
 fn appended_output(built: &Built, entry: &Node) -> Option<(String, u64)> {
     let history = entry.text_history();
-    if history.replaced > built.entry_rev {
+    let old = built.entry.as_ref()?;
+    let (current, rule) = entry.as_value()?;
+    let pointers = super::hash::text_pointers(rule, current);
+    // Per-position append history alone says nothing about added non-text blocks. Keep both
+    // the block count and text positions fixed before retaining `other` or concatenated text.
+    if old["chunks"].as_array()?.len() != current["chunks"].as_array()?.len()
+        || pointers != super::hash::text_pointers(rule, old)
+        || pointers.iter().any(|pointer| history.positions.get(pointer).is_none_or(|position| position.replaced > built.entry_rev))
+    {
         return None;
     }
-    let old = built.entry.as_ref()?;
-    let (_, lengths) = history.lengths.back()?;
-    let ((last, length), prefix) = lengths.split_last()?;
-    if prefix.iter().any(|(pointer, length)| old.pointer(pointer).and_then(Value::as_str).map(str::len) != Some(*length as usize)) {
+    let (last, prefix) = pointers.split_last()?;
+    if prefix.iter().any(|pointer| old.pointer(pointer).and_then(Value::as_str).map(str::len) != current.pointer(pointer).and_then(Value::as_str).map(str::len)) {
         return None;
     }
     let previous = old.pointer(last)?.as_str()?;
-    if *length < previous.len() as u64 {
-        return None;
-    }
-    let (current, _) = entry.as_value()?;
     let suffix = current.pointer(last)?.as_str()?.get(previous.len()..)?;
     let Spec::Value(value, _) = &built.spec else { return None };
     let held = value["text"].as_str()?;
