@@ -1706,11 +1706,11 @@ async fn a_failed_delete_frees_the_session_it_occupied() {
     .await;
     assert_eq!(peer.live("global")["op"]["id"], op);
     assert_eq!(peer.live("global")["op"]["error"]["code"], "agent_error");
-    assert_eq!(
-        peer.live(&scope)["op"]["id"],
-        own,
-        "the session shows its own operation again"
-    );
+    // The occupied session keeps the failed delete: its `op.id` never returns to `own`, so a
+    // request that expected `own` stays superseded (design §9.2, §9.3).
+    assert_ne!(peer.live(&scope)["op"]["id"], own);
+    assert_eq!(peer.live(&scope)["op"]["id"], op);
+    assert_eq!(peer.live(&scope)["op"]["status"], "failed");
     assert!(
         peer.events_of(&scope)
             .iter()
