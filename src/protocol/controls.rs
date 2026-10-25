@@ -121,6 +121,8 @@ impl SessionControls {
         }
         if let Some(options) = response.get("configOptions").and_then(Value::as_array) {
             self.config_options = Some(options.clone());
+            // The response's array has no source metadata; each option keeps its own `_meta`.
+            self.meta.config_options = None;
         }
     }
 
