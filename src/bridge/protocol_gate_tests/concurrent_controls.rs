@@ -248,6 +248,72 @@ async fn each_concurrent_control_ends_only_its_own_request_scoped_interaction() 
 }
 
 #[tokio::test]
+async fn controls_resume_after_an_in_progress_history_installation() {
+    let mut peer = Peer::start(json!({
+        "loadSession": true, "sessionCapabilities": {"fork": {}}
+    }))
+    .await;
+    peer.create(CREATED, offered()).await;
+    let (_, forked) = peer
+        .start_op(&session(CREATED), "fork", json!({"cwd": CWD}))
+        .await;
+    let fork = peer.request("session/fork").await;
+    let mut target = offered();
+    target["sessionId"] = json!("replaying");
+    peer.reply(&fork, target).await;
+    let load = peer.request("session/load").await;
+    assert_eq!(load["params"]["sessionId"], "replaying");
+    assert_eq!(
+        Peer::ended(forked).await.unwrap(),
+        json!({"sessionId": "replaying"})
+    );
+
+    // The fork already completed, but its target's optional load still owns
+    // a replay transaction. A control must not supersede that installation.
+    let (reply, admitted) = oneshot::channel();
+    peer.commands
+        .send(BridgeInput::Control {
+            session_id: "replaying".into(),
+            control: Control::SetMode {
+                mode_id: "ask".into(),
+            },
+            reply,
+        })
+        .unwrap();
+    let refusal = match tokio::time::timeout(WAIT, admitted).await.unwrap().unwrap() {
+        Err(error) => error,
+        Ok(_) => panic!("a control must not enter the active replay"),
+    };
+    assert_eq!(refusal.code, ErrorCode::NotAllowed);
+
+    let mut loaded = offered();
+    loaded["modes"]["currentModeId"] = json!("plan");
+    peer.reply(&load, loaded).await;
+    let scope = session("replaying");
+    peer.until("the replay installs its controls", |peer| {
+        peer.live(&scope)["controls"]["modes"]["currentModeId"] == "plan"
+    })
+    .await;
+    let answer = peer
+        .control(
+            "replaying",
+            Control::SetMode {
+                mode_id: "ask".into(),
+            },
+        )
+        .await;
+    let request = peer.request("session/set_mode").await;
+    assert_eq!(request["params"]["sessionId"], "replaying");
+    peer.reply(&request, json!({})).await;
+    ended(answer).await.unwrap();
+    assert_eq!(
+        peer.controls("replaying").await["modes"]["currentModeId"],
+        "ask"
+    );
+    peer.settled().await;
+}
+
+#[tokio::test]
 async fn an_old_control_response_cannot_change_a_reinstalled_session_with_the_same_id() {
     let mut peer = Peer::start(json!({"sessionCapabilities": {"close": {}}})).await;
     peer.create(CREATED, offered()).await;
