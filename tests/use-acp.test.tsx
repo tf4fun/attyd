@@ -541,6 +541,201 @@ describe("workspace, read side", () => {
     scope: "global", rev, ops: [{ op: "set", path: "/live/op", value: op("global", fields) }, ...more],
   } as StreamEvent);
 
+  type Creation = "create" | "fork";
+  interface RecordedOperation {
+    id: string;
+    after: string | null;
+    kind: string;
+    rev: number;
+    status: string;
+    error?: { code: string; agentCode?: number };
+  }
+
+  async function startCreation(kind: Creation): Promise<Post> {
+    if (kind === "fork") await shownSession();
+    else {
+      await mount("/");
+      await emit(globalSnapshot());
+      await emit(catalogSnapshot());
+    }
+    await act(async () => {
+      if (kind === "create") hook.newSession("/proj");
+      else hook.forkSession();
+    });
+    await settle();
+    expect(posts).toHaveLength(1);
+    return posts[0];
+  }
+
+  function creationBody(
+    kind: Creation,
+    currentOp: Omit<RecordedOperation, "rev">,
+    records: RecordedOperation[],
+    heldSince = 1,
+  ): Record<string, unknown> {
+    const scope = kind === "create" ? "global" : "session/s1";
+    const live = kind === "create" ? globalLive({ op: op(scope, currentOp) }) : sessionLive({ op: op(scope, currentOp) });
+    return { live, ops: records, ...(kind === "fork" ? { history: "complete", prompts: [], entries: [], heldSince } : {}) };
+  }
+
+  /** Commits the explicitly supplied operations without delivering their intermediate cuts. */
+  function missedOperations(kind: Creation, operations: Array<Omit<RecordedOperation, "rev">>): RecordedOperation[] {
+    const scope = kind === "create" ? "global" : "session/s1";
+    return operations.map((operation) => {
+      const { error: _error, ...admitted } = operation;
+      const rev = bridge.snapshot(scope, creationBody(kind, { ...admitted, status: "running" }, [])).rev;
+      bridge.snapshot(scope, creationBody(kind, operation, []));
+      return { ...operation, rev };
+    });
+  }
+
+  function creationErrors(kind: Creation): string {
+    return hook.state.timeline.flatMap((item) => item.type === "error" && item.operation === kind ? [item.message] : []).join("\n");
+  }
+
+  for (const kind of ["create", "fork"] as const) {
+    it(`settles an accepted ${kind} failure from its target log after two later operations`, async () => {
+      const sent = await startCreation(kind);
+      const id = sent.body.id!;
+      const laterKind = kind === "create" ? "authenticate" : "prompt";
+      const later = { id: "later-2", after: "later-1", kind: laterKind, status: "completed" };
+      const records = missedOperations(kind, [
+        { id, after: sent.body.expect, kind, status: "failed", error: { code: "agent_error", agentCode: -32603 } },
+        { id: "later-1", after: id, kind: laterKind, status: "completed" },
+        later,
+      ]);
+      await act(async () => hook.reconnect());
+      const scope = kind === "create" ? "global" : "session/s1";
+      await emit(snapshot(scope, creationBody(kind, later, records)));
+
+      expect(hook.state.sessionTransition).toBeUndefined();
+      expect(creationErrors(kind)).toMatch(/fail/iu);
+      expect(posts).toHaveLength(1);
+      // A fresh user action is possible again; settling the old request sent nothing.
+      await act(async () => {
+        if (kind === "create") hook.newSession("/proj");
+        else hook.forkSession();
+      });
+      await settle();
+      expect(posts).toHaveLength(2);
+      expect(posts[1].body.id).not.toBe(id);
+    });
+
+    it(`settles a lost ${kind} response from an admitted terminal record while its stream still lags`, async () => {
+      respond = () => LOST;
+      const target = kind === "create" ? "global" : "sessions/s1";
+      read = (url) => url.startsWith(`/api/v2/targets/${target}/ops/`) ? {
+        status: 200,
+        body: { outcome: "admitted", record: {
+          id: posts[0].body.id, after: posts[0].body.expect, kind, rev: 10,
+          status: "failed", error: { code: "agent_error", agentCode: -32603 },
+        } },
+      } : undefined;
+      await startCreation(kind);
+
+      expect(hook.state.sessionTransition).toBeUndefined();
+      expect(creationErrors(kind)).toMatch(/fail/iu);
+      expect(creationErrors(kind)).not.toMatch(/may have taken effect/iu);
+      await settle();
+      expect(posts).toHaveLength(1);
+    });
+  }
+
+  for (const reason of ["expired", "released", "restarted"] as const) {
+    it(`keeps an accepted request accepted when its result becomes ${reason}, without resending it`, async () => {
+      const kind = reason === "released" ? "fork" : "create";
+      const sent = await startCreation(kind);
+      const id = sent.body.id!;
+      read = (url) => url.includes("/ops/") ? { status: 200, body: { outcome: "unknown", reason } } : undefined;
+      if (reason === "expired") {
+        // All 64 retained records are later than our accepted operation.
+        const later = Array.from({ length: 64 }, (_, index) => ({
+          id: `later-${index}`, after: index === 0 ? id : `later-${index - 1}`,
+          kind: "authenticate", status: "completed",
+        }));
+        const records = missedOperations(kind, later);
+        await emit(snapshot("global", creationBody(kind, later[63], records)));
+      } else if (reason === "released") {
+        const reopened = { id: "reopened", after: null, kind: "load", status: "completed" };
+        const heldSince = bridge.snapshot("session/s1", creationBody(kind, reopened, [])).rev;
+        await emit(snapshot("session/s1", { ...creationBody(kind, reopened, [], heldSince), historyRev: heldSince }));
+      } else {
+        await act(async () => hook.reconnect());
+        bridge = new TreeBridge("E2");
+        await emit(globalSnapshot(globalLive({ op: op("global", { id: "new-instance" }) })));
+      }
+
+      expect(hook.state.sessionTransition).toBeUndefined();
+      const message = creationErrors(kind);
+      expect(message).toMatch(/accept|admit/iu);
+      expect(message).toMatch(/unknown|unavailable|cannot|could not|no longer/iu);
+      expect(message).not.toMatch(/may have taken effect/iu);
+      await settle();
+      expect(posts).toHaveLength(1);
+    });
+
+    it(`leaves a lost request with an ${reason} outcome to the user without sending a new id`, async () => {
+      respond = () => LOST;
+      read = (url) => url.includes("/ops/") ? { status: 200, body: { outcome: "unknown", reason } } : undefined;
+      await startCreation(reason === "released" ? "fork" : "create");
+      expect(hook.state.sessionTransition).toBeUndefined();
+      expect(creationErrors(reason === "released" ? "fork" : "create")).toMatch(/may|unknown|uncertain|cannot/iu);
+      await settle();
+      expect(posts).toHaveLength(1);
+    });
+  }
+
+  it("finds a completed fork by origin after its source operation was replaced twice", async () => {
+    const sent = await startCreation("fork");
+    const id = sent.body.id!;
+    const later = { id: "later-2", after: "later-1", kind: "prompt", status: "completed" };
+    const records = missedOperations("fork", [
+      { id, after: sent.body.expect, kind: "fork", status: "completed" },
+      { id: "later-1", after: id, kind: "prompt", status: "completed" },
+      later,
+    ]);
+    // One stream event contains both the held target and the source's later log.
+    const globalCut = bridge.snapshot("global", { live: globalLive({ sessions: {
+      ...held, forked: { ...held.s1, sessionId: "forked", origin: id },
+    } }) });
+    const sourceCut = bridge.snapshot("session/s1", creationBody("fork", later, records));
+    await act(async () => current().onmessage?.({ data: JSON.stringify({
+      instance: bridge.instance, rev: sourceCut.rev,
+      changes: [...globalCut.changes!, ...sourceCut.changes!],
+    }) }));
+    await settle();
+    expect(window.location.pathname).toMatch(/\/sessions\/forked$/u);
+    expect(hook.state.sessionTransition).toBeUndefined();
+    expect(posts).toHaveLength(1);
+  });
+
+  it("does not let a late create response from a previous navigation clear a newer transition", async () => {
+    let finishFirst!: (answer: { status: number; body: { op: string } }) => void;
+    respond = (post) => posts.length === 1
+      ? new Promise((resolve) => { finishFirst = resolve; })
+      : { status: 202, body: { op: post.body.id } };
+    const sent = await startCreation("create");
+    const id = sent.body.id!;
+    await act(async () => hook.openProject("/elsewhere"));
+    const route = window.location.pathname;
+    await emit(globalOpChanged(1, {
+      id, after: sent.body.expect, kind: "create", status: "completed", result: { sessionId: "old-created" },
+    }));
+    let started = false;
+    await act(async () => { started = hook.newSession("/elsewhere"); });
+    await settle();
+    expect(started).toBe(true);
+    expect(posts).toHaveLength(2);
+    expect(hook.state.sessionTransition?.kind).toBe("new");
+
+    await act(async () => finishFirst({ status: 202, body: { op: id } }));
+    await settle();
+    expect(window.location.pathname).toBe(route);
+    expect(hook.state.sessionTransition?.kind).toBe("new");
+    expect(creationErrors("create")).toBe("");
+    expect(posts).toHaveLength(2);
+  });
+
   it("creates a session and goes to it when the document shows the create completed with it", async () => {
     await mount("/");
     await emit(globalSnapshot());
@@ -650,9 +845,13 @@ describe("workspace, read side", () => {
   // log, asked after the answer was lost, has it.
   it("settles a create whose answer was lost from the bridge's document, not from a replica that lags", async () => {
     respond = () => LOST;
-    read = (url) => url.startsWith("/api/v2/targets/global/ops/")
-      ? { status: 200, body: { outcome: "admitted", record: { id: posts[0].body.id, after: "g0", kind: "create", status: "running" } } }
-      : undefined;
+    read = (url) => {
+      if (!url.startsWith("/api/v2/targets/global/ops/")) return undefined;
+      const running = { id: posts[0].body.id, after: "g0", kind: "create", status: "running" };
+      // Admission was committed, but its stream event has not reached this page.
+      const rev = bridge.snapshot("global", { live: globalLive({ op: op("global", running) }) }).rev;
+      return { status: 200, body: { outcome: "admitted", record: { ...running, rev } } };
+    };
     await mount("/");
     await emit(globalSnapshot());
     await emit(catalogSnapshot());
