@@ -358,6 +358,16 @@ describe("queued writes (C2, C3; acceptance 15)", () => {
       expect(q.items(S)).toHaveLength(0);
     });
 
+    it("is never sent as a new write because its repeat was refused", async () => {
+      const { net, view, queue: q } = await lostWrite();
+      view.show({ id: "op-A", status: "completed" }, S, held(11, []));
+      q.update(S);
+      net.calls[1].respond(409, { error: { code: "stale", message: "expected another operation" } });
+      await flush();
+      expect(net.calls).toHaveLength(2);
+      expect(q.items(S)[0].state).toBe("uncertain");
+    });
+
     it("is left to the user when the bridge restarted, and nothing is sent", async () => {
       const { net, view, queue: q } = await lostWrite();
       view.show({ id: "op-X", status: "completed" }, S, held(3, [], { epoch: "J" }));
