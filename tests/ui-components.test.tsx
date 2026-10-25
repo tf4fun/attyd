@@ -369,7 +369,6 @@ describe("ACP UI component contract", () => {
           id: "tool:fixture",
           type: "tool",
           call: {
-            sessionUpdate: "tool_call",
             toolCallId: "fixture",
             title: "shell · cat /workspace/fixture.ts",
             kind: "execute",

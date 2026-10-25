@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 
-import { act, type ReactNode } from "react";
+import { act, type ComponentProps, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ContentBlock } from "@agentclientprotocol/sdk";
@@ -44,7 +44,7 @@ describe("ACP interactive UI contract", () => {
         { type: "diff", path: "/workspace/config.ts", oldText: "old", newText: "new" },
         { type: "terminal", terminalId: "terminal" },
       ] }}
-      terminalSnapshots={[{ terminalId: "terminal", sessionId: "session", output: "Checked configuration", truncated: false }]}
+      terminalSnapshots={[{ terminalId: "terminal", sessionId: "session", output: "Checked configuration", truncated: false, released: false }]}
       onRespond={onRespond}
     />);
     const subject = requireElement(container.querySelector(".permission-subject"));
@@ -388,7 +388,6 @@ describe("ACP interactive UI contract", () => {
           id: "tool:fixture",
           type: "tool",
           call: {
-            sessionUpdate: "tool_call",
             toolCallId: "fixture",
             title: "shell · cat /workspace/fixture.ts",
             kind: "execute",
@@ -1367,7 +1366,7 @@ describe("ACP interactive UI contract", () => {
   });
 
   it("uses commands in the focused restored text and appends links without reordering", async () => {
-    const onSubmit = vi.fn(() => false);
+    const onSubmit = vi.fn<ComponentProps<typeof PromptComposer>["onSubmit"]>(() => false);
     const blocks: ContentBlock[] = [
       { type: "text", text: "First", _meta: { keep: true } },
       { type: "resource_link", uri: "urn:fixture:A", name: "A" },
@@ -1417,7 +1416,7 @@ describe("ACP interactive UI contract", () => {
   });
 
   it("preserves attachment-only prompts and appends newly pasted files in order", async () => {
-    const onSubmit = vi.fn(() => false);
+    const onSubmit = vi.fn<ComponentProps<typeof PromptComposer>["onSubmit"]>(() => false);
     const blocks: ContentBlock[] = [{ type: "resource_link", uri: "urn:fixture:original", name: "Original" }];
     await render(root, <PromptComposer disabled={false} running={false} commands={[]}
       capabilities={{ embeddedContext: true }}
@@ -1655,7 +1654,7 @@ describe("ACP interactive UI contract", () => {
       .toEqual(["ChatGPT Codex", "Codex CLI"]);
 
     await click(requireElement([...controls.querySelectorAll('[role="option"]')]
-      .find((option) => option.textContent === "Codex CLI")));
+      .find((option) => option.textContent === "Codex CLI") ?? null));
     expect(onConfig).toHaveBeenCalledWith("provider", "codex_cli");
     expect(document.activeElement).toBe(provider);
   });

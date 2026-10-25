@@ -63,8 +63,8 @@ export function refusal(status: number, body: unknown): { kind: "refused"; error
 // Queued writes (C2, C3)
 
 /**
- * What the queue sends writes through: the revision 2 `OpsClient`, or the revision 3 one,
- * whose outcomes have the same kinds the queue acts on.
+ * What the queue sends writes through: the operation writer, which reports admission
+ * separately from the operation's completion in the replica.
  */
 export interface QueueOps {
   write(scope: string, write: StartingWrite): Promise<QueueOutcome>;
@@ -76,7 +76,7 @@ export interface QueueOps {
 
 /** The outcomes of a write as the queue reads them. */
 export type QueueOutcome =
-  | { readonly kind: "accepted" | "ended" }
+  | { readonly kind: "accepted" }
   | { readonly kind: "uncertain"; readonly write?: Write }
   | { readonly kind: "refused"; readonly error: ProtocolError }
   | { readonly kind: "blocked"; readonly reason: string };
@@ -226,7 +226,6 @@ export class WriteQueue {
     queue.refused.delete(id);
     switch (outcome.kind) {
       case "accepted":
-      case "ended":
         queue.items = queue.items.filter((item) => item.id !== id);
         queue.admitted = expect;
         break;

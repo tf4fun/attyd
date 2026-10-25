@@ -8,7 +8,7 @@ import { act, StrictMode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Entry, PromptState } from "../shared/entries";
-import type { Op } from "../shared/protocol";
+import type { Op, PromptBlock, ProtocolError } from "../shared/protocol";
 import { scopeOf } from "../shared/scope-feed";
 import { useAcp } from "../web/src/lib/use-acp";
 import { TreeBridge } from "./fixtures/tree-bridge";
@@ -17,7 +17,7 @@ import { TreeBridge } from "./fixtures/tree-bridge";
 type StreamEvent =
   | { scope: string; snapshot: { epoch: string; rev: number; digest: string; doc: Record<string, unknown>; entries?: { changed: ReadonlyArray<readonly [number, unknown]> } } }
   | { scope: string; rev: number; ops: Op[] }
-  | { scope: string; end: { reason: "deleted" | "closed" | "load_failed"; error?: Record<string, unknown> } };
+  | { scope: string; end: { reason: "deleted" | "closed" | "load_failed"; error?: ProtocolError } };
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean })
   .IS_REACT_ACT_ENVIRONMENT = true;
@@ -117,7 +117,7 @@ function sessionLive(fields: Record<string, unknown> = {}) {
   };
 }
 
-const text = (value: string) => ({ type: "text", text: value });
+const text = (value: string) => ({ type: "text", text: value } satisfies PromptBlock);
 const user = (value: string): Entry => ({ kind: "message", role: "user", chunks: [{ content: text(value) }] });
 const reply = (value: string): Entry => ({ kind: "message", role: "agent", chunks: [{ content: text(value) }] });
 

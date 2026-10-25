@@ -7,6 +7,8 @@ import {
   OpsClient,
   type ActionOutcome,
   type ReplicaSource,
+  type StartingWrite,
+  type Write,
   type WriteOutcome,
 } from "../shared/write-client";
 import { WriteQueue, type HttpFetch } from "../shared/protocol-client";
@@ -68,7 +70,15 @@ function shown() {
   };
 }
 
-const prompt = { kind: "prompt", args: { prompt: [{ type: "text", text: "hi" }] } } as const;
+const prompt = { kind: "prompt", args: { prompt: [{ type: "text", text: "hi" }] } } satisfies StartingWrite;
+
+function uncertainWrite(outcome: WriteOutcome): Write {
+  expect(outcome.kind).toBe("uncertain");
+  if (outcome.kind !== "uncertain" || outcome.write === undefined) {
+    throw new Error("a lost operation response must retain its write identity");
+  }
+  return outcome.write;
+}
 
 describe("operation writes (§6)", () => {
   it("sends the id it chose and the op the document shows as expect, and answers 202 with that op", async () => {
@@ -143,15 +153,15 @@ describe("operation writes (§6)", () => {
     const ops = new OpsClient(fetch, source, () => ID);
     const first = ops.write(S, prompt);
     calls[0].lose();
-    const lost = (await first) as Extract<WriteOutcome, { kind: "uncertain" }>;
-    expect(lost.write).toEqual({ id: ID, expect: "op-A", scope: S, instance: "I", at: 7 });
+    const write = uncertainWrite(await first);
+    expect(write).toEqual({ id: ID, expect: "op-A", scope: S, instance: "I", at: 7 });
 
     // The document moved on meanwhile; the repeat is still the same write.
     show({ id: "op-B" });
-    const repeat = ops.repeat(lost.write, prompt);
+    const repeat = ops.repeat(write, prompt);
     expect(calls[1].body).toEqual({ id: ID, expect: "op-A", kind: "prompt", args: prompt.args });
     calls[1].respond(202, { op: ID });
-    expect(await repeat).toEqual({ kind: "accepted", op: ID, write: lost.write });
+    expect(await repeat).toEqual({ kind: "accepted", op: ID, write });
   });
 
   it("finds out what became of a lost write from the target's log as the client holds it", async () => {
@@ -161,20 +171,20 @@ describe("operation writes (§6)", () => {
     const ops = new OpsClient(fetch, source, () => ID);
     const first = ops.write(S, prompt);
     calls[0].lose();
-    const lost = (await first) as Extract<WriteOutcome, { kind: "uncertain" }>;
+    const write = uncertainWrite(await first);
 
     // The write is in the log: it took effect.
     show({ id: ID }, S, { ops: [{ id: ID, after: "op-A" }] });
-    expect(ops.resolve(lost.write)).toBe("admitted");
+    expect(ops.resolve(write)).toBe("admitted");
     // Another operation replaced `op-A`: this one can never be admitted.
     show({ id: "op-X" }, S, { ops: [{ id: "op-X", after: "op-A" }] });
-    expect(ops.resolve(lost.write)).toBe("not_admitted");
+    expect(ops.resolve(write)).toBe("not_admitted");
     // Not admitted yet: left to the user.
     show({ id: "op-A" });
-    expect(ops.resolve(lost.write)).toBe("unknown");
+    expect(ops.resolve(write)).toBe("unknown");
     // The session was released and held again since.
     show({ id: "op-A" }, S, { heldSince: 9 });
-    expect(ops.resolve(lost.write)).toBe("unknown");
+    expect(ops.resolve(write)).toBe("unknown");
   });
 
   it("asks the bridge where the log is out of reach, and reads its answer", async () => {
@@ -184,12 +194,12 @@ describe("operation writes (§6)", () => {
     const ops = new OpsClient(fetch, source, () => ID);
     const first = ops.write(S, prompt);
     calls[0].lose();
-    const lost = (await first) as Extract<WriteOutcome, { kind: "uncertain" }>;
-    expect(ops.resolutionUrl(lost.write)).toBe(`/api/v2/targets/sessions/S/ops/${ID}?expect=op-A&instance=I&at=7`);
-    expect(ops.resolveFrom(lost.write, { outcome: "admitted", record: {} })).toBe("admitted");
-    expect(ops.resolveFrom(lost.write, { outcome: "superseded" })).toBe("not_admitted");
+    const write = uncertainWrite(await first);
+    expect(ops.resolutionUrl(write)).toBe(`/api/v2/targets/sessions/S/ops/${ID}?expect=op-A&instance=I&at=7`);
+    expect(ops.resolveFrom(write, { outcome: "admitted", record: {} })).toBe("admitted");
+    expect(ops.resolveFrom(write, { outcome: "superseded" })).toBe("not_admitted");
     for (const answer of [{ outcome: "open" }, { outcome: "unknown", reason: "restarted" }, "nonsense", undefined]) {
-      expect(ops.resolveFrom(lost.write, answer)).toBe("unknown");
+      expect(ops.resolveFrom(write, answer)).toBe("unknown");
     }
   });
 

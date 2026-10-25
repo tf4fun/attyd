@@ -127,7 +127,7 @@ describe("Agent thread history interactions", () => {
     expect(container.querySelectorAll('[aria-current="page"]')).toHaveLength(1);
 
     const filter = requireElement<HTMLInputElement>(
-      container.querySelector('input[aria-label="Filter loaded Agent threads"]'),
+      container.querySelector<HTMLInputElement>('input[aria-label="Filter loaded Agent threads"]'),
     );
     await replaceInput(filter, "arch rev");
     expect(container.textContent).toContain("Architecture review");
@@ -233,7 +233,7 @@ describe("Agent thread history interactions", () => {
     expect(container.querySelector(".session-filter-status")?.textContent).toBe("2 loaded threads");
 
     const filter = requireElement<HTMLInputElement>(
-      container.querySelector('input[aria-label="Filter loaded Agent threads"]'),
+      container.querySelector<HTMLInputElement>('input[aria-label="Filter loaded Agent threads"]'),
     );
     await replaceInput(filter, "/workspace/current");
     expect(container.querySelector(".session-filter-status")?.textContent).toBe("1 of 2 loaded threads");

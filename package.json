@@ -10,7 +10,7 @@
     "build": "npm run build:rust",
     "build:rust": "cargo build --release",
     "start": "./target/release/attyd",
-    "typecheck": "tsc --noEmit && tsc -p tsconfig.tools.json --noEmit && tsc -p tsconfig.browser.json --noEmit",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.tools.json --noEmit && tsc -p tsconfig.browser.json --noEmit && tsc -p tsconfig.tests.json --noEmit",
     "test": "vitest run",
     "test:rust": "ATTYD_SKIP_WEB_BUILD=1 cargo test",
     "protocol:types": "ATTYD_SKIP_WEB_BUILD=1 ATTYD_UPDATE_PROTOCOL_TS=1 cargo test protocol::typescript",

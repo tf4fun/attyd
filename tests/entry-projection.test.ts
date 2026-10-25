@@ -3,6 +3,7 @@
 // compactions in the order they were received, the turns they form, and how each prompt
 // ended. Every value follows from the document; an item is reused only for the entries it came from.
 import { describe, expect, it } from "vitest";
+import type { PlanEntry as AcpPlanEntry } from "@agentclientprotocol/sdk";
 import { projectEntries } from "../web/src/lib/entry-projection";
 import type { Entry, PromptState, TurnHead } from "../shared/entries";
 import { turnHeads } from "../web/src/dev/turn-heads";
@@ -21,7 +22,7 @@ const tool = (toolCallId: string, extra: Record<string, unknown> = {}): Entry =>
 const legacyPlan = (...statuses: string[]): Entry => ({
   kind: "plan", legacy: { entries: statuses.map((status) => ({ content: "step", priority: "high", status })) },
 });
-const ended = (entry: number, end: PromptState["end"]): PromptState => ({ entry, ...(end ? { end } : {}) });
+const ended = (entry: number, end?: PromptState["end"]): PromptState => ({ entry, ...(end ? { end } : {}) });
 
 const project = (entries: Entry[], prompts: PromptState[] = [], turns: TurnHead[] = turnHeads(entries, prompts)) =>
   projectEntries("S", entries, prompts, turns);
@@ -77,8 +78,9 @@ describe("entries in a thread", () => {
   });
 
   it("shows the plan an id names and a removal", () => {
+    const step = { content: "a", priority: "high", status: "completed" } satisfies AcpPlanEntry;
     const { timeline } = project([
-      { kind: "plan", update: { plan: { planId: "p", entries: [{ content: "a", priority: "high", status: "completed" }] } } },
+      { kind: "plan", update: { plan: { planId: "p", entries: [step] } } },
       { kind: "plan", update: { planId: "p" } },
     ]);
     expect(timeline[0]).toMatchObject({ type: "plan", update: { sessionUpdate: "plan_update", plan: { planId: "p" } } });
