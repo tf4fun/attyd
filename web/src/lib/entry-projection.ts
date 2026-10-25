@@ -65,10 +65,13 @@ function turnsFrom(heads: readonly TurnHead[], entries: readonly Entry[], prompt
   if (heads.length === 0) {
     return entries.length === 0 ? [] : [{ start: 0, end: entries.length, prompt: prompts.find((prompt) => prompt.entry === 0) }];
   }
+  // The prompt of a turn is the first one that opened at its start: found by entry, not by a scan per turn.
+  const opened = new Map<number, PromptState>();
+  for (const prompt of prompts) if (!opened.has(prompt.entry)) opened.set(prompt.entry, prompt);
   return heads.map(({ start, length }) => ({
     start,
     end: Math.min(start + length, entries.length),
-    prompt: prompts.find((prompt) => prompt.entry === start),
+    prompt: opened.get(start),
   }));
 }
 
