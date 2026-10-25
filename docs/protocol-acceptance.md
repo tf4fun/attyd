@@ -75,6 +75,8 @@ Revision 4 review boundaries (#216) have these concrete gates in addition to S1â
 | Poll replies from an abandoned instance or an older path version never replace current state; overlapping differential replies use the base still held | `tests/reference-client.test.ts` |
 | A cold polling read sends the directory as `cwd`, without the stream query's session prefix | `tests/reference-client.test.ts` |
 | A non-node `follow` or `GET` is refused before observing or loading its session | `server::stream_tests::tree::non_node_paths_are_refused_before_a_session_is_loaded_or_observed` |
+| A session named `segments` serves its operation and latest output through node GET, including hash verification and unchanged reads (#224, P2-7) | `server::stream_tests::tree::segment_routes::a_session_named_segments_serves_its_operation_as_a_node` and `a_session_named_segments_serves_its_latest_output_as_a_node` |
+| The same session still supports entry/output text paging across UTF-8 boundaries; hashes and the full text verify, and malformed segment parameters are refused (#224, P2-7) | `server::stream_tests::tree::segment_routes::a_session_named_segments_pages_text_and_still_refuses_bad_segment_reads`; the stream stays followed until all page reads finish |
 
 Late session demand after EOF (#224, P1-1) is covered by
 `server::stream_tests::tree::late_demand`, over real HTTP and a scripted ACP Agent:
