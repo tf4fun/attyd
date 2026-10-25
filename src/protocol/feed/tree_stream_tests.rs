@@ -12,6 +12,8 @@ use crate::protocol::tree_stream::params::parse_stream_query;
 use crate::protocol::tree_stream::wire::Change;
 use crate::session_registry::SessionRegistry;
 
+mod fixed_ends;
+
 const WAIT: Duration = Duration::from_secs(5);
 
 fn agent() -> AgentInfo {
