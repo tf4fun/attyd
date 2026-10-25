@@ -7,6 +7,7 @@
 import type { End, ProtocolError } from "./protocol";
 import type { FeedStatus, TreeFeedClient } from "./tree-feed";
 import type { TreeEnd } from "./tree-replica";
+import { isOpRecord, type OpRecord } from "./outcome";
 
 /** A scope to follow, and the working directory to load an unheld session with. */
 export interface Follow {
@@ -25,7 +26,7 @@ export interface ScopeReplica {
   /** The path version whose hash the replica last matched. */
   readonly verifiedRev: number;
   /** The log of the operations that occupied the scope (design §9.3). */
-  readonly ops: ReadonlyArray<{ readonly id: string; readonly after: string | null }>;
+  readonly ops: readonly OpRecord[];
   /** The revision at which the bridge started holding the session; null for `global` and `catalog`. */
   readonly heldSince: number | null;
 }
@@ -143,10 +144,7 @@ export class ScopeFeed {
       rev: replica.version,
       doc,
       verifiedRev: replica.verified,
-      ops: log.filter(isRecord).map((record) => ({
-        id: String(record.id),
-        after: typeof record.after === "string" ? record.after : null,
-      })),
+      ops: log.filter(isOpRecord),
       heldSince: typeof value.heldSince === "number" ? value.heldSince : null,
     };
   }

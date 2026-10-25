@@ -10,6 +10,7 @@ import {
   type WriteOutcome,
 } from "../shared/write-client";
 import { WriteQueue, type HttpFetch } from "../shared/protocol-client";
+import type { OpRecord } from "../shared/outcome";
 
 const S = "session/S";
 const OPS = "/api/v2/targets/sessions/S/ops";
@@ -50,7 +51,7 @@ function shown() {
   const source: ReplicaSource = { get: (scope) => docs.get(scope) };
   return {
     source,
-    show(op: Record<string, unknown>, scope = S, held: { rev?: number; heldSince?: number | null; ops?: { id: string; after: string | null }[] } = {}) {
+    show(op: Record<string, unknown>, scope = S, held: { epoch?: string; rev?: number; heldSince?: number | null; ops?: ({ id: string; after: string | null } | OpRecord)[] } = {}) {
       docs.set(scope, {
         epoch: "I",
         rev: 7,
@@ -83,7 +84,7 @@ describe("operation writes (§6)", () => {
       body: { id: ID, expect: "op-A", kind: "prompt", args: prompt.args },
     });
     calls[0].respond(202, { op: ID });
-    expect(await outcome).toEqual({ kind: "accepted", op: ID });
+    expect(await outcome).toEqual({ kind: "accepted", op: ID, write: { id: ID, expect: "op-A", scope: S, instance: "I", at: 7 } });
   });
 
   it("makes ids that are new for each intent", async () => {
@@ -150,7 +151,7 @@ describe("operation writes (§6)", () => {
     const repeat = ops.repeat(lost.write, prompt);
     expect(calls[1].body).toEqual({ id: ID, expect: "op-A", kind: "prompt", args: prompt.args });
     calls[1].respond(202, { op: ID });
-    expect(await repeat).toEqual({ kind: "accepted", op: ID });
+    expect(await repeat).toEqual({ kind: "accepted", op: ID, write: lost.write });
   });
 
   it("finds out what became of a lost write from the target's log as the client holds it", async () => {
@@ -201,6 +202,34 @@ describe("operation writes (§6)", () => {
     expect(calls[0].body).toEqual({ expect: "op-A", kind: "cancel", args: {} });
     calls[0].respond(202, { op: "op-A" });
     expect(await outcome).toEqual({ kind: "accepted", op: "op-A" });
+  });
+
+  it("keeps a terminal record's details from the issuing target and the outcome GET", () => {
+    const { source, show } = shown();
+    const ops = new OpsClient(http().fetch, source);
+    const write = { id: ID, expect: "op-A", scope: S, instance: "I", at: 7 };
+    const record: OpRecord = {
+      id: ID, after: "op-A", kind: "fork", rev: 8, status: "failed",
+      error: { code: "agent_error", agentCode: -32000 },
+    };
+    // A different target's log says nothing about this request.
+    show({ id: "later" }, "global", { rev: 12, ops: [record] });
+    show({ id: "op-A" });
+    expect(ops.outcome(write)).toEqual({ outcome: "open" });
+    show({ id: "later" }, S, { rev: 12, ops: [record] });
+    expect(ops.outcome(write)).toEqual({ outcome: "admitted", record });
+    const read = ops.outcomeFrom(write, { outcome: "admitted", record });
+    expect(read).toEqual({ outcome: "admitted", record });
+    if (read?.outcome === "admitted") expect(read.record).toBe(record);
+    expect(ops.resolve(write)).toBe("admitted");
+    expect(ops.resolveFrom(write, { outcome: "admitted", record })).toBe("admitted");
+    expect(ops.outcomeFrom(write, { outcome: "admitted", record: { ...record, id: "someone-else" } })).toBeUndefined();
+    expect(ops.outcomeFrom(write, { outcome: "admitted", record: { id: ID } })).toBeUndefined();
+    for (const reason of ["expired", "released", "restarted"] as const) {
+      expect(ops.outcomeFrom(write, { outcome: "unknown", reason })).toEqual({ outcome: "unknown", reason });
+    }
+    show({ id: "later" }, S, { epoch: "I2", rev: 12, ops: [record] });
+    expect(ops.outcome(write)).toEqual({ outcome: "unknown", reason: "restarted" });
   });
 });
 

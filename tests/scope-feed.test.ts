@@ -97,6 +97,26 @@ describe("the documents of the scopes", () => {
     expect(scopes.get("global")!.doc.live).toMatchObject({ agent: { phase: "x" } });
   });
 
+  it("keeps the complete bounded operation records of each scope", () => {
+    const { scopes, last } = harness();
+    scopes.follow([{ scope: "global" }, { scope: "session/s" }]);
+    const created = { id: "created", after: "g1", kind: "create", rev: 4, status: "cancelled" };
+    const forked = {
+      id: "forked", after: "o1", kind: "fork", rev: 5, status: "failed",
+      error: { code: "agent_error", agentCode: -32000 },
+    };
+    last().emit({ instance: "I", rev: 9, changes: [
+      snapshot("/global", global({ ops: [created] }), 9),
+      snapshot("/sessions/s", session({ ops: [forked] }), 9),
+    ] });
+    expect(scopes.get("global")!.ops).toEqual([created]);
+    expect(scopes.get("session/s")!.ops).toEqual([forked]);
+    const record = scopes.get("session/s")!.ops[0];
+    expect(scopes.get("session/s")!.ops[0]).toBe(record);
+    expect(Object.isFrozen(record)).toBe(true);
+    expect(Object.isFrozen(record.error)).toBe(true);
+  });
+
   it("tells its listeners which scope changed, and nothing of a session that is not there yet", () => {
     const { scopes, last } = harness();
     const changed: string[] = [];

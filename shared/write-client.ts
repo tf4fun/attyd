@@ -16,12 +16,15 @@ import {
   type ActionOutcome,
   type HttpFetch,
 } from "./protocol-client";
-import type { Logged, TargetState } from "./outcome";
+import { isOpRecord, outcome, type Logged, type OpRecord, type Outcome, type TargetState } from "./outcome";
 import { newOperationId, nextStep, resolveWrite, type Resolution, type Write } from "./write-resolution";
 import type { Next } from "./outcome";
 
 export type { ActionOutcome } from "./protocol-client";
 export type { Write } from "./write-resolution";
+
+/** The same outcome table, with the retained record when its full contents are available. */
+export type OperationOutcome = Outcome<OpRecord | undefined>;
 
 /** The documents a writer reads `expect` from, and what it held when it wrote. */
 export interface ReplicaSource {
@@ -46,7 +49,7 @@ interface ShownOperation {
 
 export type WriteOutcome =
   /** `202`: admitted, nothing more; the document shows what follows. */
-  | { readonly kind: "accepted"; readonly op: string }
+  | { readonly kind: "accepted"; readonly op: string; readonly write?: Write }
   /** A definite refusal: the write changed nothing (§6.4). */
   | { readonly kind: "refused"; readonly error: ProtocolError }
   /** No definite answer: the write may have taken effect (C3). Repeat or resolve it with `write`. */
@@ -93,6 +96,18 @@ export class OpsClient {
     return resolveWrite(write, this.#targetOf(write));
   }
 
+  /** Admission and the retained result, read only from the target this write was issued to. */
+  outcome(write: Write): OperationOutcome | undefined {
+    const target = this.#targetOf(write);
+    if (target === undefined) return undefined;
+    const result = outcome(target, {
+      ...write, instance: write.instance ?? target.instance, at: write.at ?? 0,
+    });
+    if (result.outcome !== "admitted") return result;
+    return { outcome: "admitted", record: target.ops.find((record): record is OpRecord =>
+      record.id === write.id && isOpRecord(record)) };
+  }
+
   /** What the client may do next with `write` (§9.3), from the same log. */
   nextStep(write: Write): Next {
     return nextStep(write, this.#targetOf(write));
@@ -125,6 +140,22 @@ export class OpsClient {
     return answer.outcome === "superseded" ? "not_admitted" : "unknown";
   }
 
+  /** The HTTP outcome, retaining its terminal status and error summary as well as admission. */
+  outcomeFrom(write: Write, answer: unknown): OperationOutcome | undefined {
+    if (!isRecord(answer)) return undefined;
+    if (answer.outcome === "admitted") {
+      return isOpRecord(answer.record) && answer.record.id === write.id
+        ? { outcome: "admitted", record: answer.record }
+        : undefined;
+    }
+    if (answer.outcome === "open" || answer.outcome === "superseded") return { outcome: answer.outcome };
+    if (answer.outcome === "unknown" &&
+      (answer.reason === "expired" || answer.reason === "released" || answer.reason === "restarted")) {
+      return { outcome: "unknown", reason: answer.reason };
+    }
+    return undefined;
+  }
+
   /** Asks the running operation to end; a cancel has no id of its own. */
   cancel(scope: string): Promise<WriteOutcome> {
     const op = shownOperation(this.#replicas, scope);
@@ -146,7 +177,7 @@ export class OpsClient {
     const answer = await response.json().catch(() => undefined);
     if (response.status === 202) {
       return isRecord(answer) && typeof answer.op === "string"
-        ? { kind: "accepted", op: answer.op }
+        ? { kind: "accepted", op: answer.op, ...(write === undefined ? {} : { write }) }
         : { kind: "uncertain", write };
     }
     const refused = refusal(response.status, answer);

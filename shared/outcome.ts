@@ -5,9 +5,27 @@
 // held instance `i` and the target at path version `t`. The rule reads what the tree publishes of
 // the target: its `op`, its `ops` and, for a session, `heldSince`.
 
+import type { ErrorCode, OperationKind, OperationStatus } from "./protocol";
+
 export interface Logged {
   id: string;
   after: string | null;
+}
+
+/** The bounded record the bridge keeps for an admitted operation (§4.4, §9.3). */
+export interface OpRecord extends Readonly<Logged> {
+  readonly kind: OperationKind;
+  readonly rev: number;
+  readonly status: OperationStatus;
+  readonly error?: { readonly code: ErrorCode; readonly agentCode?: number };
+}
+
+export function isOpRecord(value: unknown): value is OpRecord {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return typeof record.id === "string" && (record.after === null || typeof record.after === "string") &&
+    typeof record.kind === "string" && Number.isSafeInteger(record.rev) && (record.rev as number) >= 0 &&
+    ["running", "completed", "failed", "cancelled"].includes(record.status as string);
 }
 
 export interface TargetState {
@@ -29,8 +47,8 @@ export interface Request {
 
 export type Reason = "restarted" | "released" | "expired";
 
-export type Outcome =
-  | { outcome: "admitted"; record: string }
+export type Outcome<Record = string> =
+  | { outcome: "admitted"; record: Record }
   | { outcome: "superseded" }
   | { outcome: "open" }
   | { outcome: "unknown"; reason: Reason };
