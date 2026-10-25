@@ -55,6 +55,39 @@ async fn ended(answer: ControlAnswer) -> Result<(), ProtocolError> {
         .expect("the control's answer was dropped")
 }
 
+async fn control_owners(peer: &Peer) -> BTreeSet<String> {
+    let lock = peer.lock();
+    let state = lock.lock().await;
+    state
+        .sessions
+        .resources(CREATED)
+        .unwrap()
+        .control_requests
+        .iter()
+        .cloned()
+        .collect()
+}
+
+async fn assert_controls_settled(peer: &Peer) {
+    let lock = peer.lock();
+    let state = lock.lock().await;
+    assert!(
+        state.sessions.resources(CREATED).unwrap().control_requests.is_empty()
+    );
+    assert!(
+        state.action_replies.is_empty(),
+        "every control answered its waiter"
+    );
+    assert!(
+        state.in_flight_request_ids.is_empty(),
+        "every command owner was released"
+    );
+    assert!(
+        state.sessions.state(CREATED).unwrap().operation.is_none(),
+        "controls leave no exclusive operation behind"
+    );
+}
+
 #[tokio::test]
 async fn concurrent_modes_reach_the_agent_and_fold_in_response_order() {
     let mut peer = Peer::start(json!({})).await;
@@ -62,8 +95,11 @@ async fn concurrent_modes_reach_the_agent_and_fold_in_response_order() {
     let scope = session(CREATED);
     let op = peer.live(&scope)["op"].clone();
     let (first, first_request) = mode(&mut peer, "plan").await;
+    let first_owners = control_owners(&peer).await;
+    assert_eq!(first_owners.len(), 1);
     let (second, second_request) = mode(&mut peer, "ask").await;
     assert_ne!(first_request["id"], second_request["id"]);
+    assert_eq!(control_owners(&peer).await.len(), 2);
 
     // A notification is reduced before either acknowledgement. The second
     // request answers first; the earlier request must still be live afterwards.
@@ -82,6 +118,14 @@ async fn concurrent_modes_reach_the_agent_and_fold_in_response_order() {
         peer.controls(CREATED).await["modes"]["currentModeId"],
         "ask"
     );
+    assert_eq!(
+        control_owners(&peer).await,
+        first_owners,
+        "only the answered control retires"
+    );
+    peer.settled().await;
+    assert_eq!(peer.live(&scope)["controls"]["modes"]["currentModeId"], "ask");
+    assert_eq!(peer.live(&scope)["op"], op, "the ACK creates no public result");
     peer.reply(&first_request, json!({})).await;
     ended(first).await.unwrap();
     assert_eq!(
@@ -94,6 +138,7 @@ async fn concurrent_modes_reach_the_agent_and_fold_in_response_order() {
         "plan"
     );
     assert_eq!(peer.live(&scope)["op"], op, "controls install no operation");
+    assert_controls_settled(&peer).await;
 }
 
 #[tokio::test]
@@ -103,20 +148,39 @@ async fn concurrent_configs_fold_each_success_and_a_later_error_changes_nothing(
     let scope = session(CREATED);
     let op = peer.live(&scope)["op"].clone();
     let (first, first_request) = config(&mut peer, true).await;
+    let first_owners = control_owners(&peer).await;
+    assert_eq!(first_owners.len(), 1);
     let (second, second_request) = config(&mut peer, false).await;
+    assert_eq!(control_owners(&peer).await.len(), 2);
     peer.reply(&second_request, json!({"configOptions": verbose(false)}))
         .await;
     ended(second).await.unwrap();
+    assert_eq!(peer.controls(CREATED).await["configOptions"], verbose(false));
+    assert_eq!(
+        control_owners(&peer).await,
+        first_owners,
+        "the first control still owns its work"
+    );
+    peer.settled().await;
+    assert_eq!(peer.live(&scope)["controls"]["configOptions"], verbose(false));
+    assert_eq!(peer.live(&scope)["op"], op);
     peer.reply(&first_request, json!({"configOptions": verbose(true)}))
         .await;
     ended(first).await.unwrap();
     assert_eq!(peer.controls(CREATED).await["configOptions"], verbose(true));
+    assert_controls_settled(&peer).await;
 
     let (failed, failed_request) = config(&mut peer, false).await;
+    let failed_owners = control_owners(&peer).await;
     let (successful, successful_request) = config(&mut peer, true).await;
     peer.reply(&successful_request, json!({"configOptions": verbose(true)}))
         .await;
     ended(successful).await.unwrap();
+    assert_eq!(
+        control_owners(&peer).await,
+        failed_owners,
+        "the unanswered control still owns its work"
+    );
     peer.refuse(&failed_request).await;
     assert_eq!(ended(failed).await.unwrap_err().code, ErrorCode::AgentError);
     assert_eq!(peer.controls(CREATED).await["configOptions"], verbose(true));
@@ -126,6 +190,7 @@ async fn concurrent_configs_fold_each_success_and_a_later_error_changes_nothing(
         verbose(true)
     );
     assert_eq!(peer.live(&scope)["op"], op);
+    assert_controls_settled(&peer).await;
 }
 
 #[tokio::test]
