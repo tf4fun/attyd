@@ -23,6 +23,7 @@ use crate::protocol::subscription::Subscribed;
 use crate::protocol::publication::Publication;
 use crate::protocol::replica::Replica;
 use crate::protocol::op::OpEnd;
+use crate::protocol::outcome::{self, Request as OutcomeRequest};
 
 const WAIT: Duration = Duration::from_secs(5);
 
@@ -425,16 +426,29 @@ impl Peer {
                 .unwrap()
                 .to_string()
         };
+        self.write_request(
+            scope,
+            OpWrite {
+                id: None,
+                expect,
+                kind: kind.to_string(),
+                args,
+            },
+        )
+        .await
+    }
+
+    /// Delivers an already prepared request without refreshing its identity or `expect`.
+    async fn write_request(
+        &self,
+        scope: Scope,
+        write: OpWrite,
+    ) -> Result<operations::OperationAdmission, ProtocolError> {
         let (reply, admitted) = oneshot::channel();
         self.commands
             .send(BridgeInput::Operation {
                 scope,
-                write: OpWrite {
-                    id: None,
-                    expect,
-                    kind: kind.to_string(),
-                    args,
-                },
+                write,
                 reply,
             })
             .unwrap();
@@ -442,6 +456,54 @@ impl Peer {
             .await
             .expect("the write was not admitted")
             .expect("the bridge dropped the write")
+    }
+
+    fn prepared_prompt(&self, target: &str) -> (OpWrite, OutcomeRequest) {
+        self.publication.lock().feed.with_tree(|tree| {
+            let state = outcome::state_of(tree, target).unwrap();
+            let request = OutcomeRequest {
+                id: crate::protocol::op::operation_id(),
+                expect: state.op,
+                instance: state.instance,
+                at: tree.get(&format!("/{target}")).unwrap().srev(),
+            };
+            let write = OpWrite {
+                id: Some(request.id.clone()),
+                expect: request.expect.clone(),
+                kind: "prompt".into(),
+                args: json!({"prompt": [text("only once")]}),
+            };
+            (write, request)
+        })
+    }
+
+    fn outcome(&self, target: &str, request: &OutcomeRequest) -> Value {
+        self.publication
+            .lock()
+            .feed
+            .with_tree(|tree| outcome::resolve(tree, target, request).unwrap())
+    }
+
+    /// EOF joins the coordinator, so every remaining ACP send is available for inspection.
+    async fn finish_without_another_prompt(&mut self) {
+        self.eof().await.unwrap();
+        tokio::time::timeout(WAIT, async {
+            while let Some(raw) = self.requests.next().await {
+                match serde_json::from_str(&raw).unwrap() {
+                    Value::Array(batch) => self.buffered.extend(batch),
+                    message => self.buffered.push_back(message),
+                }
+            }
+        })
+        .await
+        .expect("the ACP sender outlived the coordinator");
+        assert!(
+            self.buffered
+                .iter()
+                .all(|message| message["method"] != "session/prompt"),
+            "a duplicate reached the Agent: {:?}",
+            self.buffered
+        );
     }
 
     /// Sends a control action to `session_id` and waits until the bridge admits it; the receiver
@@ -1690,10 +1752,53 @@ async fn a_delete_takes_the_close_interaction_and_ends_the_scope_with_deleted() 
 }
 
 #[tokio::test]
-async fn a_failed_delete_frees_the_session_it_occupied() {
+async fn a_delayed_prompt_and_its_unchanged_retries_execute_once() {
+    let mut peer = Peer::start(json!({})).await;
+    peer.create(CREATED, json!({})).await;
+    let scope = Scope::Session(CREATED.into());
+    let scope_name = scope.to_string();
+    let target = format!("sessions/{CREATED}");
+    let (delayed, receipt) = peer.prepared_prompt(&target);
+    // The original has not reached ingress. The resolution read overtakes it.
+    assert_eq!(peer.outcome(&target, &receipt)["outcome"], "open");
+    let retry = peer
+        .write_request(scope.clone(), delayed.clone())
+        .await
+        .unwrap();
+    assert_eq!(retry.op, receipt.id);
+    let prompt = peer.request("session/prompt").await;
+    assert_eq!(prompt["params"]["prompt"], delayed.args["prompt"]);
+    // The original arrives while its retry is awaiting the Agent. It is admitted without
+    // issuing another ACP request, and the same holds after the prompt completes.
+    assert_eq!(
+        peer.write_request(scope.clone(), delayed.clone())
+            .await
+            .unwrap()
+            .op,
+        receipt.id
+    );
+    peer.reply(&prompt, json!({"stopReason": "end_turn"})).await;
+    peer.until("the one prompt completes", |peer| {
+        peer.live(&scope_name)["op"]["status"] == "completed"
+    })
+    .await;
+    assert_eq!(
+        peer.write_request(scope, delayed).await.unwrap().op,
+        receipt.id
+    );
+    assert_eq!(peer.outcome(&target, &receipt)["outcome"], "admitted");
+    assert_eq!(peer.timeline(CREATED).await.as_array().unwrap().len(), 1);
+    peer.settled().await;
+    peer.finish_without_another_prompt().await;
+}
+
+#[tokio::test]
+async fn a_failed_delete_rejects_a_delayed_prompt_and_allows_one_new_request() {
     let mut peer = Peer::start(json!({"sessionCapabilities": {"close": {}, "delete": {}}})).await;
     peer.create(CREATED, json!({})).await;
     let scope = format!("session/{CREATED}");
+    let target = format!("sessions/{CREATED}");
+    let (delayed, receipt) = peer.prepared_prompt(&target);
     let own = peer.live(&scope)["op"]["id"].clone();
     let (op, _) = peer
         .start_op("global", "delete", json!({"sessionId": CREATED}))
@@ -1706,20 +1811,65 @@ async fn a_failed_delete_frees_the_session_it_occupied() {
     .await;
     assert_eq!(peer.live("global")["op"]["id"], op);
     assert_eq!(peer.live("global")["op"]["error"]["code"], "agent_error");
-    assert_eq!(
-        peer.live(&scope)["op"]["id"],
-        own,
-        "the session shows its own operation again"
-    );
+    // The occupied session keeps the failed delete: its `op.id` never returns to `own`, so a
+    // request that expected `own` stays superseded (design §9.2, §9.3).
+    assert_ne!(peer.live(&scope)["op"]["id"], own);
+    assert_eq!(peer.live(&scope)["op"]["id"], op);
+    assert_eq!(peer.live(&scope)["op"]["status"], "failed");
     assert!(
         peer.events_of(&scope)
             .iter()
             .all(|event| event.get("end").is_none())
     );
-    // The freed session takes a new operation.
-    peer.install(&scope, OperationKind::Fork, json!({}))
-        .await;
+    assert_eq!(peer.outcome(&target, &receipt)["outcome"], "superseded");
+    // The delayed original reaches ingress before any subsequent write can hide a return to
+    // the old ID. It must already be stale, and a refused prompt adds no user entry.
+    let refused = peer
+        .write_request(Scope::parse(&scope).unwrap(), delayed.clone())
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(refused.code, crate::protocol::documents::ErrorCode::Stale);
+    assert_eq!(peer.timeline(CREATED).await, json!([]));
+    // Only now may the client give the input a new identity, against the failed delete.
+    let (replacement, replacement_receipt) = peer.prepared_prompt(&target);
+    assert_eq!(replacement.expect, op);
+    let admitted = peer
+        .write_request(Scope::parse(&scope).unwrap(), replacement.clone())
+        .await
+        .unwrap();
+    assert_eq!(admitted.op, replacement_receipt.id);
+    let prompt = peer.request("session/prompt").await;
+    // Another delayed copy arrives after the replacement started. It remains stale; neither
+    // it nor a retry of the new request may send another prompt.
+    let refused = peer
+        .write_request(Scope::parse(&scope).unwrap(), delayed)
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(refused.code, crate::protocol::documents::ErrorCode::Stale);
+    assert_eq!(
+        peer.write_request(Scope::parse(&scope).unwrap(), replacement.clone())
+            .await
+            .unwrap()
+            .op,
+        admitted.op
+    );
+    peer.reply(&prompt, json!({"stopReason": "end_turn"})).await;
+    peer.until("the replacement prompt completes", |peer| {
+        peer.live(&scope)["op"]["status"] == "completed"
+    })
+    .await;
+    assert_eq!(
+        peer.write_request(Scope::parse(&scope).unwrap(), replacement)
+            .await
+            .unwrap()
+            .op,
+        admitted.op
+    );
+    assert_eq!(peer.timeline(CREATED).await.as_array().unwrap().len(), 1);
     peer.settled().await;
+    peer.finish_without_another_prompt().await;
 }
 
 #[tokio::test]
