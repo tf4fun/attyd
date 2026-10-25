@@ -101,7 +101,12 @@ impl Feed {
                     self.view_pins.insert(view, now + VIEW_LINGER);
                 }
                 if let Some(session_id) = session_of(&follow.path) {
-                    self.pending_loads.insert(session_id.clone(), extra.cwd.get(&session_id).cloned());
+                    // A later poll of the operation need not repeat the directory the
+                    // output read supplied while the connection was still recovering.
+                    let pending = self.pending_loads.entry(session_id.clone()).or_default();
+                    if let Some(cwd) = extra.cwd.get(&session_id) {
+                        *pending = Some(cwd.clone());
+                    }
                     self.touched.insert(session_id);
                 }
             }
