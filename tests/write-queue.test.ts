@@ -70,7 +70,7 @@ describe("queued writes (C2, C3; acceptance 15)", () => {
     const view = shown();
     view.show({ id: "op-A", kind: "prompt", status: "running" });
     const ops = new OpsClient(net.fetch, view.source);
-    const live = { get: (scope: string) => { const doc = view.source.get(scope); return doc === undefined ? undefined : { live: doc.doc.live }; } };
+    const live = { get: (scope: string) => { const doc = view.source.get(scope); return doc === undefined ? undefined : { live: doc.doc.live, rev: doc.rev }; } };
     return { net, view, queue: new WriteQueue(ops, live) };
   }
 

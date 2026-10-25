@@ -19,7 +19,8 @@ export type HttpFetch = (
 
 /** What the queue reads of a replica: its `live`, from the document the feed holds. */
 export interface QueueSource {
-  get(scope: string): { readonly live?: unknown } | undefined;
+  /** `rev` is the path version held: it moves whenever the stream delivers a change. */
+  get(scope: string): { readonly live?: unknown; readonly rev?: number } | undefined;
 }
 
 /** The `op` of the aligned replica of `scope`. */
@@ -137,11 +138,13 @@ export class WriteQueue {
     // it could only be refused as stale: wait for the replica to show another.
     if (op === undefined || op.status === "running" || op.id === queue.admitted) return;
     // A write whose answer was lost and which may still be admitted is repeated unchanged, once per
-    // `op` shown (§9.3); the repeat is admitted now, or is a no-op if a delayed copy got there first.
-    const repeating = queue.items.find((item) => item.state === "uncertain" && item.lost !== undefined
-      && this.#ops.nextStep?.(item.lost) === "repeat-unchanged" && queue.repeated.get(item.id) !== op.id);
+    // change of the replica (§9.3); the repeat is admitted now, or is a no-op if a delayed copy got there first.
+    const rev = this.#replicas.get(scope)?.rev;
+    const repeating = rev === undefined ? undefined : queue.items.find((item) => item.state === "uncertain"
+      && item.lost !== undefined && this.#ops.nextStep?.(item.lost) === "repeat-unchanged"
+      && queue.repeated.get(item.id) !== rev);
     if (repeating?.lost !== undefined && this.#ops.repeat !== undefined) {
-      queue.repeated.set(repeating.id, op.id);
+      queue.repeated.set(repeating.id, rev);
       queue.sending = { id: repeating.id, expect: repeating.lost.expect };
       queue.items = queue.items.map((item) => (item.id === repeating.id ? { ...item, state: "sending" } : item));
       const lost = repeating.lost;
@@ -240,6 +243,7 @@ export class WriteQueue {
           state: "uncertain",
           ...(outcome.write === undefined ? {} : { lost: outcome.write }),
         });
+        queue.repeated.set(id, this.#replicas.get(scope)?.rev);
         break;
       case "blocked":
         queue.items = replaced(queue.items, index, { id, write, state: "queued" });
@@ -258,8 +262,8 @@ interface ScopeQueue {
   admitted?: string;
   /** The `op.id` each refused write was refused against. */
   refused: Map<number, string>;
-  /** The `op.id` a lost write was last repeated against. */
-  repeated: Map<number, string>;
+  /** The path version held when a lost write was last sent or repeated: it is repeated again only after the stream moved on. */
+  repeated: Map<number, number | undefined>;
 }
 
 function replaced<T>(items: readonly T[], index: number, item: T): readonly T[] {
