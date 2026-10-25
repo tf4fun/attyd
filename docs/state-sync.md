@@ -583,11 +583,12 @@ Deviations from the plan, on purpose:
 
 ### 7.4 Second milestone: bridge-to-client replication
 
-Status: implemented ([§7.5](#75-implementation-status-2026-10-23)); the design, proposed
-2026-10-21, is [protocol revision 3](protocol.md):
-replication of the memory model's documents with `epoch`/`rev`, differential
-snapshots, client-computed digests at snapshots and checkpoints, client-chosen
-operation IDs and results in the document. Its acceptance cases are
+Status: implemented ([§7.5](#75-implementation-status-2026-10-23)). The first design,
+proposed 2026-10-21, replicated the memory model's documents with `epoch`/`rev`,
+differential snapshots and client-computed digests (revision 3, kept at the baseline in the
+[history index](history.md)); it is replaced by [protocol revision 4](protocol.md) (state
+tree, per-path versions, Merkle hashes, text windows, serialized writes; reasons in the
+[design](protocol-r4-design.md)). Its acceptance cases are
 [protocol §12.4](protocol.md#124-independent-acceptance). It was implemented after
 the first-layer gate.
 
@@ -623,10 +624,9 @@ wire shape or repair algorithm.
 
 After the first-layer gate, finish this stage in order:
 
-1. Map the validated memory to documents and resource reads: protocol §3–§4
-   (proposed).
+1. Map the validated memory to the state tree and resource reads: protocol §2–§4.
 2. One synchronization, verification and repair scheme with its write semantics:
-   protocol §5–§7 (proposed). Replace the turn log, hash chain and held responses in
+   protocol §5–§9. Replace the turn log, hash chain and held responses in
    the bridge DTOs and `shared/` together, so only one contract remains.
 3. Add protocol §12.4's independent and failure-injection cases, then implement the
    smallest bridge and client changes that satisfy them. Keep the existing working paths

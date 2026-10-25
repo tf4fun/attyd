@@ -1,4 +1,4 @@
-# Browser cases of the revision 2 protocol, and what covers them on revision 3
+# Browser cases of the revision 2 protocol, and what covers them on revisions 3 and 4
 
 `tests/browser/protocol-ui.pw.ts` and its harness `tests/browser/protocol-harness.ts` drove the real server
 through a barrier proxy that held, lost and injected events of the revision 2 stream. The app runs on revision 3
@@ -8,7 +8,7 @@ that switched the app; they are in git history at `bcf9bce`.
 A barrier proxy is a way to produce a client's failure conditions, not a behavior: what each retired case asserts is
 now asserted one layer down, against the store (`useAcp`, `tests/use-acp.test.tsx`), the write queue and client
 (`tests/write-queue.test.ts`, `tests/write-client.test.ts`, `tests/write-resolution.test.ts`) and the verifying
-replica (`tests/feed-client.test.ts`, `tests/document-replica.test.ts`), where the lost, late and reordered
+replica (`tests/tree-feed.test.ts`, `tests/tree-replica.test.ts`, and `tests/scope-feed.test.ts` for the documents the page reads), where the lost, late and reordered
 events and responses are exact, not timing-dependent; the browser suite (`tests/browser/*.pw.ts`) keeps the flows
 the user sees against the real server. `[~]` marks a case about the revision 2 model that has no counterpart.
 
@@ -23,10 +23,10 @@ the user sees against the real server. `[~]` marks a case about the revision 2 m
 - [x] answers an interaction the load asks for while it runs: bridge `reconnecting_before_during_and_after_a_load…`
   (an interaction answered during a load) and `interactions_of_create_fork_set_config_and_list…`; use-acp "shows each
   pending interaction once, whichever scope shows it"
-- [x] subscribes again with the head it holds after the stream breaks, without reading the scope: feed-client
-  "subscribes again later with the version it holds"; document-replica "asks for the version it holds"
-- [x] follows only the session it switches to and ignores the stream it replaced: feed-client "closes the stream it
-  replaces and lets nothing of it through"; document-replica "ignores the events of a replaced stream"
+- [x] subscribes again with the head it holds after the stream breaks, without reading the scope: tree-feed
+  "subscribes again later with the instance and the version it holds"; tree-replica "asks for what it follows, from what it holds, and for a session's load with its directory"
+- [x] follows only the session it switches to and ignores the stream it replaced: tree-feed "closes the stream it
+  replaces and lets nothing of it through"; tree-replica "lets nothing of a replaced stream or of a path not followed through"
 
 ### operations and answers
 - [x] lets one of two racing pages start the prompt and resubmits the refused input after the operation ends:
