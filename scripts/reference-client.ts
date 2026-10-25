@@ -166,13 +166,16 @@ export class ReferenceClient {
         done();
         resolve(value);
       };
+      // A checkpoint changes nothing the feed reports, so the client looks again now and then.
       const unsubscribe = this.#feed.subscribe(check);
+      const again = setInterval(check, 50);
       const timer = setTimeout(() => {
         done();
         reject(new Error(`Timed out waiting for ${label}: ${JSON.stringify({ op: this.op, output: this.output && { ...this.output, text: { ...this.output.text, text: this.output.text.text.slice(-40) } } })}`));
       }, timeout);
       const done = (): void => {
         clearTimeout(timer);
+        clearInterval(again);
         unsubscribe();
       };
       check();
