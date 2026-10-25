@@ -202,8 +202,11 @@ second backend. Client agreement cannot replace the direct source-memory tests.
 
 ## Protocol publication benchmark
 
-The non-draft CI job `protocol-benchmark` runs `scripts/protocol-benchmark.py` on one
-runner, comparing `ff9890e` (before the #216 performance changes) with the tested head.
+The opt-in CI job `protocol-benchmark` runs only for non-draft pull requests carrying
+the `protocol-benchmark` label. Add the label before marking ready or pushing the next
+commit. It runs `scripts/protocol-benchmark.py` on one runner, comparing `ff9890e` (before
+the #216 performance changes) with the tested head; `--baseline` selects another revision
+for a future performance review.
 The same ignored Rust fixture runs on both revisions; only its view-call adapter changes
 for the earlier API. The application is cleaned and rebuilt between revisions, while
 dependency artifacts are reused. Logs and a comparison table are uploaded as the

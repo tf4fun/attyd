@@ -133,7 +133,7 @@ jobs:
         run: cargo check --locked --features dev
 
   protocol-benchmark:
-    if: ${{ !(github.event_name == 'pull_request' && github.event.pull_request.draft) }}
+    if: ${{ github.event_name == 'pull_request' && !github.event.pull_request.draft && contains(github.event.pull_request.labels.*.name, 'protocol-benchmark') }}
     needs: web-client
     runs-on: ubuntu-26.04
     timeout-minutes: 35
