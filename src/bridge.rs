@@ -6308,11 +6308,16 @@ mod tests {
         }
 
         pub(super) async fn next(&mut self) {
-            use crate::protocol::tree_stream::{documents::{Document, document, scope_of}, wire::{Change, EndReason}};
             let event = tokio::time::timeout(Duration::from_secs(10), self.stream.next())
                 .await
                 .expect("timed out waiting for a stream event")
                 .expect("the stream closed");
+            self.take(event);
+        }
+
+        /// Both awaited events and already queued events advance the same R4 client.
+        fn take(&mut self, event: crate::protocol::tree_stream::wire::Event) {
+            use crate::protocol::tree_stream::{documents::{Document, document, scope_of}, wire::{Change, EndReason}};
             self.client.apply(&event).unwrap();
             for change in event.changes.iter().flatten() {
                 if let Change::End { end, .. } = change {
@@ -6541,13 +6546,7 @@ mod tests {
         }
         tokio::time::sleep(Duration::from_millis(300)).await;
         while let Some(event) = session.stream.try_next() {
-            let event = serde_json::to_value(event).unwrap();
-            session
-                .replicas
-                .get_mut(scope)
-                .unwrap()
-                .apply(&event)
-                .unwrap();
+            session.take(event);
             ops.push(session.live(scope)["op"].clone());
         }
         assert!(
