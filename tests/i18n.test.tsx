@@ -81,8 +81,12 @@ describe("interface languages", () => {
     expect(i18n.t("mcpServers", { count: 2 })).toBe("2 MCP servers");
     await setLanguagePreference("zh-CN");
     expect(i18n.t("mcpServers", { count: 2 })).toBe("2 个 MCP 服务");
-    const original = i18n.getResource("zh-CN", "app", "projects");
-    i18n.addResource("zh-CN", "app", "projects", undefined);
+    const bundle: unknown = i18n.getResourceBundle("zh-CN", "app");
+    if (bundle === null || typeof bundle !== "object") throw new Error("expected the Chinese app bundle");
+    const original: unknown = Reflect.get(bundle, "projects");
+    if (typeof original !== "string") throw new Error("expected the projects translation");
+    // Remove the key from the real resource store to exercise a missing translation.
+    expect(Reflect.deleteProperty(bundle, "projects")).toBe(true);
     try {
       expect(i18n.t("projects")).toBe("Projects");
     } finally {

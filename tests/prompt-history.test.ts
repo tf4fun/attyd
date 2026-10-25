@@ -13,7 +13,7 @@ describe("ACP prompt history", () => {
 
     expect(collectPromptHistory([
       message("local", "user", local),
-      message("answer", "agent", [{ type: "text", text: "answer" }]),
+      assistant("answer", [{ type: "text", text: "answer" }]),
       message("replayed", "protocol-user", replayed),
     ])).toEqual([local, replayed]);
   });
@@ -24,7 +24,7 @@ describe("ACP prompt history", () => {
     expect(collectPromptHistory([
       message("optimistic", "user", repeated),
       message("echo", "protocol-user", reorderedEcho),
-      message("answer", "agent", [{ type: "text", text: "done" }]),
+      assistant("answer", [{ type: "text", text: "done" }]),
       message("intentional-repeat", "user", repeated),
     ])).toEqual([repeated, repeated]);
   });
@@ -46,4 +46,8 @@ function message(
   blocks: ContentBlock[],
 ): TimelineItem {
   return { id, type: "message", role, blocks, raw: [] };
+}
+
+function assistant(id: string, blocks: ContentBlock[]): TimelineItem {
+  return { id, type: "assistant", chunks: [{ id: `${id}:0`, role: "agent", blocks, raw: [] }] };
 }
