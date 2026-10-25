@@ -381,6 +381,11 @@ impl Subscriber {
         let mut changes = Vec::new();
         for (path, state) in &mut self.paths {
             if state.over {
+                // Tracking ended, but its final notification may still be waiting to be
+                // written. Only the queued end is owed; never recreate a delivered one.
+                if let Some(end) = queued_ends.remove(path.as_str()) {
+                    changes.push(Change::End { path: path.clone(), end });
+                }
                 continue;
             }
             match snapshot_windowed(tree, path, state.written, state.window) {
