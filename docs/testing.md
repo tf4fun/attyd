@@ -15,6 +15,12 @@ The production host and every host-level integration harness run the Rust backen
 used only for the browser application, shared browser protocol types, test Agents, and test
 drivers; there is no second backend implementation.
 
+For a real Agent and browser walkthrough, use the
+[feature matrix and manual acceptance guide](manual-acceptance.md). It maps stable case IDs
+to actions, expected observations and related automated tests, and provides a run template.
+Record manual observations separately from CI results and from capabilities the Agent
+does not advertise.
+
 ## Test layers
 
 | Layer | Command | Purpose |
