@@ -104,6 +104,7 @@ try {
   await rival.until(() => (rival.op !== undefined ? true : undefined), "the rival's head");
   await stream.until(() => (stream.op?.id === rival.op?.id ? true : undefined), "the same head");
   const expect = stream.op!.id;
+  const at = stream.opVersion!;
   const [a, b] = await Promise.all([
     stream.prompt("output-window-flow", { expect }),
     rival.prompt("output-window-flow", { expect }),
@@ -113,7 +114,7 @@ try {
   assert.equal(lost.status, 409, JSON.stringify([a, b]));
   assert.equal((lost.body as { error: { code: string } }).error.code, "stale");
   await stream.until(() => (stream.op?.id === (won.body as { op: string }).op && stream.op.status !== "running" ? true : undefined), "the winner to end");
-  const query = new URLSearchParams({ expect: lost.expect, instance: stream.instance! });
+  const query = new URLSearchParams({ expect: lost.expect, instance: stream.instance!, at: String(at) });
   const outcome = await (await fetch(`${origin}/api/v2/targets/sessions/${encodeURIComponent(sessionId)}/ops/${lost.id}?${query}`)).json();
   assert.equal((outcome as { outcome: string }).outcome, "superseded", JSON.stringify(outcome));
 

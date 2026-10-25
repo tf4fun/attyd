@@ -137,6 +137,11 @@ export class ReferenceClient {
     return this.#replica(this.outputPath)?.verified;
   }
 
+  /** The path version of the operation head held. */
+  get opVersion(): number | undefined {
+    return this.#replica(this.opPath)?.version;
+  }
+
   get version(): number | undefined {
     return this.#replica(this.outputPath)?.version;
   }
