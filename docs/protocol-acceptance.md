@@ -371,6 +371,14 @@ r2 are new or changed in revision 2; their runtime code is not migrated yet.
     comes without a notification shows the new mode or the confirmed config options
     when its response arrives; a failed one changes nothing and returns its error.
 
+    Setup responses also replace the source of the configuration they provide
+    (#224, P3-1). In `protocol::controls::tests`,
+    `setup_config_options_replace_the_early_source_but_keep_each_options_metadata`
+    checks both empty and nonempty response arrays: old update/envelope metadata is
+    removed, while each option's `_meta` is retained.
+    `a_setup_response_without_config_options_keeps_the_early_value_and_source`
+    checks that omitted or null `configOptions` preserve the early value and source.
+
 <a id="a19"></a>
 
 19. **Retained content (S8)** r2. A scripted turn with thoughts, message chunks of two
