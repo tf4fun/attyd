@@ -124,9 +124,9 @@ pub(super) fn admit(
         }
     };
     if matches!(control, Control::Close) {
-        // Like a cancel, a close answers the session's pending permissions
-        // cancelled before the Agent hears of it.
-        let cancelled = operations::cancel_outcomes(state, &scope);
+        // Close admission cancels permissions only. Elicitation keeps its own
+        // session or parent request lifetime.
+        let cancelled = operations::close_permission_cancellations(state, &scope);
         let deliveries = operations::deliveries(state, cancelled)?;
         operations::deliver(state, sink, deliveries);
     }

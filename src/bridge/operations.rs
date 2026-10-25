@@ -195,9 +195,12 @@ pub(super) fn deliver(
     }
 }
 
-/// The cancel outcome of each pending interaction of the operation that
-/// `scope` shows (protocol §6.2).
-pub(super) fn cancel_outcomes(state: &BridgeState, scope: &OpScope) -> Vec<(String, Answer)> {
+/// Close admission answers only pending permissions with cancel (protocol §7).
+/// Elicitation remains answerable until its session or parent request ends.
+pub(super) fn close_permission_cancellations(
+    state: &BridgeState,
+    scope: &OpScope,
+) -> Vec<(String, Answer)> {
     let published = state.protocol.publication.lock();
     published.feed.with_tree(|tree| {
         let Some(interactions) = admission::target(tree, scope)
@@ -210,12 +213,12 @@ pub(super) fn cancel_outcomes(state: &BridgeState, scope: &OpScope) -> Vec<(Stri
             .into_iter()
             .filter_map(|id| {
                 let (interaction, _) = interactions.child(id)?.as_value()?;
-                let answer = if interaction["kind"] == "permission" {
-                    Answer::Permission(RequestPermissionOutcome::Cancelled)
-                } else {
-                    Answer::Elicitation(CreateElicitationResponse::new(ElicitationAction::Cancel))
-                };
-                Some((id.to_string(), answer))
+                (interaction["kind"] == "permission").then(|| {
+                    (
+                        id.to_string(),
+                        Answer::Permission(RequestPermissionOutcome::Cancelled),
+                    )
+                })
             })
             .collect()
     })

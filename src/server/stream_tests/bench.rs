@@ -13,6 +13,7 @@ use super::*;
 use crate::protocol::tree_stream::documents::Document;
 
 mod admission;
+mod close_interactions;
 mod closing;
 mod execution;
 mod interactions;
