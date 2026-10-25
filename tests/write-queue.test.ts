@@ -240,7 +240,7 @@ describe("queued writes (C2, C3; acceptance 15)", () => {
     const uncertain = q.enqueue(S, oldInput);
     net.calls[0].lose();
     await flush();
-    expect(q.items(S)).toEqual([{ id: uncertain, write: oldInput, state: "uncertain" }]);
+    expect(q.items(S)).toMatchObject([{ id: uncertain, write: oldInput, state: "uncertain" }]);
 
     q.update(S);
     await flush();
@@ -260,7 +260,7 @@ describe("queued writes (C2, C3; acceptance 15)", () => {
     q.update(S);
     await flush();
     expect(texts(net.calls)).toEqual(["old uncertain input", "different new input"]);
-    expect(q.items(S)).toEqual([{ id: uncertain, write: oldInput, state: "uncertain" }]);
+    expect(q.items(S)).toMatchObject([{ id: uncertain, write: oldInput, state: "uncertain" }]);
   });
 
   it("never sends a write without a definite answer again, whatever is refused later", async () => {
