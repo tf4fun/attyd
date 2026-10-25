@@ -337,7 +337,7 @@ export class Workspace {
     this.#seen.add(op.id);
     this.#listing = { ...this.#listing, failedRevision: catalog.revision };
     if (needsAuthentication(op.error)) this.#authRequired = true;
-    if (op.error != null) this.#errors = [...this.#errors, operationError(`op:${op.id}:error`, op as never, op.error)];
+    if (op.error != null) this.#errors = [...this.#errors, operationError(`op:${op.id}:error`, op, op.error)];
   }
 
   /** Lists the first page when there is none, and later pages while a session is looked for. */
@@ -1149,7 +1149,7 @@ export class Workspace {
     // Failures of the global operations this page started, and its own write answers.
     if (globalOp != null && globalOp.status === "failed" && globalOp.error != null && this.#mine.has(globalOp.id) &&
       authOp == null) {
-      timeline = [...timeline, operationError(`op:${globalOp.id}:error`, globalOp as never, globalOp.error)];
+      timeline = [...timeline, operationError(`op:${globalOp.id}:error`, globalOp, globalOp.error)];
     }
     timeline = [...timeline, ...this.#errors];
 
@@ -1168,7 +1168,7 @@ export class Workspace {
       typeof globalOp.input.sessionId === "string" ? globalOp.input.sessionId : undefined;
 
     const summaries = Object.values(global?.sessions ?? {});
-    const sessions = listedSessions(this.#catalogSessions(), global as never);
+    const sessions = listedSessions(this.#catalogSessions(), global);
     const last = catalog?.pages.at(-1);
 
     return {
