@@ -139,6 +139,15 @@ responses fold in arrival order and a retired installation cannot accept an old 
 | EOF settles all controls and clears their old resource ownership; the next connection loads and accepts new controls | `eof_settles_all_controls_and_the_next_connection_has_no_old_control_work` |
 | A session without followers stays held until its last control finishes, then becomes eligible for release | `the_last_outstanding_control_keeps_an_unfollowed_session_needed` |
 
+The mode and config response-order gates also cover retirement of the old control
+test path (#234, P3-2). After the second request answers first, its resource is gone
+and the first request still owns its work. These cases compare canonical controls
+with the independently applied published tree, without changing the public
+operation or its result. After all replies, control resources, action waiters and
+command owners are empty, with no exclusive session operation left behind. The config
+case checks cleanup after both success and Agent refusal. These assertions exercise
+the production coordinator; no separate test-only control reducer is retained.
+
 The existing `runtime_state` cases
 `same_session_reload_success_does_not_create_a_second_business_session` and
 `same_session_reload_error_remains_actionable_and_does_not_loop` also assert that a
