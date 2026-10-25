@@ -29,10 +29,11 @@ async fn new_operations_require_a_client_id_without_changing_any_target() {
             if null_id {
                 write["id"] = Value::Null;
             }
+            assert!(serde_json::from_value::<crate::protocol::wire::OpRequest>(write.clone()).is_err());
             // Keep this raw: the convenience op helper supplies a client identity.
             let (status, body) = bench.call(Method::POST, &ops_path(scope), Some(write)).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{kind}, null={null_id}: {body}");
-            assert_eq!(body["error"]["code"], "invalid", "{body}");
+            assert_eq!(body["error"]["code"], "invalid_request", "{body}");
         }
     }
     link.quiet(QUIET).await;
@@ -52,6 +53,14 @@ async fn cancel_without_a_new_id_keeps_the_prompt_identity_and_is_repeatable() {
     assert_eq!((status, body), (StatusCode::ACCEPTED, json!({"op": CLIENT_ID})));
     let prompt = link.request("session/prompt").await;
     let cancel = json!({"expect": CLIENT_ID, "kind": "cancel", "args": {}});
+    let running = bench.document("session/s").await;
+    for id in [json!(7), json!("short"), json!({}), json!([])] {
+        let mut malformed = cancel.clone();
+        malformed["id"] = id;
+        let (status, body) = bench.call(Method::POST, &ops_path("session/s"), Some(malformed)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+    assert_eq!(bench.document("session/s").await, running);
     let (status, body) = bench.call(Method::POST, &ops_path("session/s"), Some(cancel.clone())).await;
     assert_eq!((status, body), (StatusCode::ACCEPTED, json!({"op": CLIENT_ID})));
     let notification = link.request("session/cancel").await;
@@ -110,4 +119,33 @@ async fn losing_the_http_response_preserves_the_client_identity_and_queryable_re
     let (status, body) = bench.call(Method::POST, &path, Some(write)).await;
     assert_eq!((status, body), (StatusCode::ACCEPTED, json!({"op": CLIENT_ID})));
     link.quiet(QUIET).await;
+}
+
+#[tokio::test]
+async fn generated_request_dtos_serialize_to_the_public_http_contract() {
+    use crate::protocol::wire::{Empty, OpRequest, PromptArgs};
+
+    let (bench, mut link) = Bench::ws(json!({})).await;
+    bench.create_with(&mut link, "s", json!({})).await;
+    let expect = bench.expect_of("session/s").await.as_str().unwrap().to_string();
+    let request = OpRequest::Prompt {
+        id: CLIENT_ID.to_string(),
+        expect,
+        args: PromptArgs { prompt: vec![serde_json::from_value(text("typed request")).unwrap()] },
+    };
+    let body = serde_json::to_value(&request).unwrap();
+    assert_eq!(serde_json::from_value::<OpRequest>(body.clone()).unwrap(), request);
+    let (status, body) = bench.call(Method::POST, &ops_path("session/s"), Some(body)).await;
+    assert_eq!((status, body), (StatusCode::ACCEPTED, json!({"op": CLIENT_ID})));
+    let prompt = link.request("session/prompt").await;
+    assert_eq!(prompt["params"]["prompt"], json!([text("typed request")]));
+
+    let cancel = serde_json::to_value(OpRequest::Cancel {
+        expect: CLIENT_ID.to_string(), args: Empty {},
+    }).unwrap();
+    assert!(cancel.get("id").is_none());
+    let (status, body) = bench.call(Method::POST, &ops_path("session/s"), Some(cancel)).await;
+    assert_eq!((status, body), (StatusCode::ACCEPTED, json!({"op": CLIENT_ID})));
+    link.request("session/cancel").await;
+    link.reply(&prompt, json!({"stopReason": "cancelled"})).await;
 }

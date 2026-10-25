@@ -871,27 +871,27 @@ async fn malformed_and_foreign_writes_are_refused_with_the_protocol_error_body()
         ),
         (
             None,
-            json!({"expect": global, "kind": "create", "args": {"cwd": CWD}}).to_string(),
+            json!({"id": CLIENT_ID, "expect": global, "kind": "create", "args": {"cwd": CWD}}).to_string(),
             "no content type",
         ),
         (
             Some("application/json"),
-            json!({"kind": "create", "args": {"cwd": CWD}}).to_string(),
+            json!({"id": CLIENT_ID, "kind": "create", "args": {"cwd": CWD}}).to_string(),
             "no expect",
         ),
         (
             Some("application/json"),
-            json!({"expect": global, "args": {"cwd": CWD}}).to_string(),
+            json!({"id": CLIENT_ID, "expect": global, "args": {"cwd": CWD}}).to_string(),
             "no kind",
         ),
         (
             Some("application/json"),
-            json!({"expect": global, "kind": "create", "args": [CWD]}).to_string(),
+            json!({"id": CLIENT_ID, "expect": global, "kind": "create", "args": [CWD]}).to_string(),
             "args that are not an object",
         ),
         (
             Some("application/json"),
-            json!({"expect": 7, "kind": "create", "args": {"cwd": CWD}}).to_string(),
+            json!({"id": CLIENT_ID, "expect": 7, "kind": "create", "args": {"cwd": CWD}}).to_string(),
             "an expect that is not a string",
         ),
     ] {

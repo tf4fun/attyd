@@ -35,11 +35,11 @@ fn operation(target: &Node) -> &Value {
         .unwrap_or(&Value::Null)
 }
 
-/// `POST /api/v2/scopes/{scope}/ops` (protocol §6.1).
+/// An operation write to a target (protocol §6.1).
 #[derive(Debug, Clone)]
 pub(crate) struct OpWrite {
-    /// The ID the client chose for the operation it starts (§6.5); the bridge
-    /// names the operation when the write has none.
+    /// HTTP requires this for new operations (§6.5). Internal bridge callers may
+    /// omit it to let the bridge name an operation; cancel starts no operation.
     pub id: Option<String>,
     pub expect: String,
     pub kind: String,

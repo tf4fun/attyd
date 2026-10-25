@@ -918,15 +918,16 @@ fn op_write(headers: &HeaderMap, body: &[u8]) -> Result<OpWrite, Response> {
         Some(args) if args.is_object() => args.clone(),
         Some(_) => return Err(invalid_request("args must be an object")),
     };
+    let kind = field("kind")?;
     let id = match body.get("id") {
-        None | Some(Value::Null) => None,
+        None | Some(Value::Null) if kind == "cancel" => None,
         Some(Value::String(id)) => Some(id.clone()),
-        Some(_) => return Err(invalid_request("id must be a string")),
+        _ => return Err(invalid_request("id must be a string")),
     };
     Ok(OpWrite {
         id,
         expect: field("expect")?,
-        kind: field("kind")?,
+        kind,
         args,
     })
 }

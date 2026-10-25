@@ -202,11 +202,7 @@ export type End = { reason: EndReason, error?: ProtocolError, };
 
 export type EndReason = "deleted" | "closed" | "load_failed";
 
-export type OpRequest = { 
-/**
- * The `op.id` the write expects the scope to show.
- */
-expect: string, } & ({ "kind": "prompt", "args": PromptArgs } | { "kind": "fork", "args": ForkArgs } | { "kind": "create", "args": CreateArgs } | { "kind": "delete", "args": DeleteArgs } | { "kind": "authenticate", "args": MethodArgs } | { "kind": "logout", "args": Empty } | { "kind": "terminal_login", "args": TerminalLoginArgs } | { "kind": "list", "args": ListArgs } | { "kind": "cancel", "args": Empty });
+export type OpRequest = { "kind": "prompt", id: string, expect: string, args: PromptArgs, } | { "kind": "fork", id: string, expect: string, args: ForkArgs, } | { "kind": "create", id: string, expect: string, args: CreateArgs, } | { "kind": "delete", id: string, expect: string, args: DeleteArgs, } | { "kind": "authenticate", id: string, expect: string, args: MethodArgs, } | { "kind": "logout", id: string, expect: string, args: Empty, } | { "kind": "terminal_login", id: string, expect: string, args: TerminalLoginArgs, } | { "kind": "list", id: string, expect: string, args: ListArgs, } | { "kind": "cancel", expect: string, args: Empty, };
 
 export type OpArgs = { "kind": "prompt", "args": PromptArgs } | { "kind": "fork", "args": ForkArgs } | { "kind": "create", "args": CreateArgs } | { "kind": "delete", "args": DeleteArgs } | { "kind": "authenticate", "args": MethodArgs } | { "kind": "logout", "args": Empty } | { "kind": "terminal_login", "args": TerminalLoginArgs } | { "kind": "list", "args": ListArgs } | { "kind": "cancel", "args": Empty };
 
