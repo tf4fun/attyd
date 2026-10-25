@@ -4,6 +4,7 @@
 use super::*;
 
 mod late_demand;
+mod segment_routes;
 
 /// The next event that has `changes` or `check`, as a whole.
 async fn next(sse: &mut Sse) -> Value {

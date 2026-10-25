@@ -1121,12 +1121,18 @@ async fn read_node(
     RawQuery(query): RawQuery,
     State(state): State<AppState>,
 ) -> Response {
+    use crate::protocol::tree_stream::params::{is_node, is_path};
     use crate::protocol::tree_stream::segments::{SegmentRead, read_segment};
     let invalid = |message: String| {
         protocol_error(StatusCode::BAD_REQUEST, ProtocolError::new(ErrorCode::InvalidRequest, message))
     };
+    let requested = format!("/{node}");
+    // A legal node takes precedence over the paging suffix: `segments` can itself be an ID.
+    if is_path(&requested) && is_node(&requested) {
+        return read_path(&requested, query.as_deref().unwrap_or(""), state).await;
+    }
     let Some((path, index)) = node.rsplit_once("/segments/") else {
-        return read_path(&format!("/{node}"), query.as_deref().unwrap_or(""), state).await;
+        return read_path(&requested, query.as_deref().unwrap_or(""), state).await;
     };
     let Ok(index) = index.parse::<usize>() else {
         return invalid(format!("not a segment index: {index:?}"));
