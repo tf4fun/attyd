@@ -755,7 +755,8 @@ the last request asks what became of a write (§6.6).
 - **Cancel** applies to `prompt` (`session/cancel`, which answers the session's pending
   permissions `cancelled`) and `terminal_login`. It sets `cancelRequested`; repeating it
   changes nothing; the operation keeps its scopes until it actually ends. A cancel is
-  not an operation of its own: its `id` is ignored and `op` is unchanged.
+  not an operation of its own: omit `id`, and `op` is unchanged. A supplied non-null
+  `id` is checked for its string type and format, then ignored.
 - **Fork** and **create** install the returned session (memory model §6.3, §9); its
   summary carries `origin`, the operation's `id`. Only one installation runs: admission
   refuses a global write or another session's fork while a fork runs, without replacing
@@ -797,7 +798,9 @@ are actions. Neither waits for the running operation.
 ### 6.5 Operation IDs
 
 A client generates each new operation's `id`: 128 random bits in unpadded base64url
-(22 characters). A malformed `id` is `invalid_request`. A client uses a new `id` for
+(22 characters). For every new operation, a missing, null or malformed `id` is
+`invalid_request`, before admission or any state change. The HTTP endpoint never
+allocates a missing client ID. A client uses a new `id` for
 each new intent and the same `id` only to repeat a write whose answer it did not get.
 IDs the bridge allocates (`load`, `open`, `none`) have the same form.
 

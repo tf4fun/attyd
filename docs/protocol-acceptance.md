@@ -66,6 +66,16 @@ failure paths; `src/protocol/tree_doc/tests.rs` checks the invariant assertion.
 
 ## Acceptance
 
+Public operation identities (#234, P2-2) are checked over real HTTP and ACP in
+`src/server/stream_tests/bench/request_identity.rs`:
+
+| Boundary | Gate |
+| --- | --- |
+| Every new operation rejects missing/null `id`, without changing any target or sending ACP | `new_operations_require_a_client_id_without_changing_any_target` |
+| Cancel needs no new ID, repeats without another ACP notification, and still rejects malformed supplied IDs | `cancel_without_a_new_id_keeps_the_prompt_identity_and_is_repeatable` |
+| A response lost before any bytes are read is resolved using the original identity; running/failed records remain observable and repeats execute once | `losing_the_http_response_preserves_the_client_identity_and_queryable_result` |
+| Rust request DTOs serialize to accepted HTTP prompt/cancel requests; the generated TypeScript sender requires the same `id`/`kind`/`args` contract | `generated_request_dtos_serialize_to_the_public_http_contract`, `protocol::typescript::generated_typescript_is_current`, and `tests/write-client.test.ts` |
+
 Revision 4 review boundaries (#216) have these concrete gates in addition to S1–S5:
 
 | Boundary | Gate |
