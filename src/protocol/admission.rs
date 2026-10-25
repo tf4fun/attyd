@@ -175,6 +175,14 @@ pub(crate) fn admit(
             format!("the operation of {scope} is running"),
         ));
     }
+    // Close is an action: its pending response does not replace the ended public op.
+    // Repeated identities have already returned above; only a new prompt is refused.
+    if kind == OperationKind::Prompt && held.field("closing").and_then(Value::as_bool) == Some(true) {
+        return Err(refuse(
+            ErrorCode::NotAllowed,
+            format!("{scope} is closing"),
+        ));
+    }
     if kind == OperationKind::Delete
         && let Some(session_id) = write.args["sessionId"].as_str()
         && tree
