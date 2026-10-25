@@ -564,6 +564,7 @@ starts without it; no code.
 | 5 — operation log and targets | the bounded `ops` log, the four outcomes (Rust and TypeScript on one set of vectors), target writes and the resolution read (#208) |
 | 6 — views, holding, ordering | derived views in the revision of their commit, fixed views ending `absent` / `replaced`, `GET /api/v2/nodes/{path}` as a short subscription that opens, holds and releases a session, request ordering across instances (#209) |
 | 7 — the browser | the tree replica, stream client and scope documents in `shared/`; writes to targets; the thread projected by the published turns; revision 3's TypeScript and its HTTP surface removed; the protocol document rewritten (#210) |
+| 8 — the reference client | windows in the TypeScript replica (hash, request), a minimal device client on a stream and by polling, scenarios S1–S5 against a real server with the figures of a window (#211) |
 
 The internal revision 3 publisher (the engine and the per-scope feed) remains in the bridge as the source of admission (`live` of a scope) and attachments; it serves no endpoint and is to be folded into the tree.
 

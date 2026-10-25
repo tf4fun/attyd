@@ -27,6 +27,20 @@ Baseline convergence cases below do not substitute for those failure-injection
 requirements. Cases 32–35 contain later presentation work; implementation status
 and release-parity classifications remain in their respective ledgers.
 
+**Revision 4 (2026-10-24).** The failure-injection cases are
+[protocol §12.4](protocol.md#124-independent-acceptance). The scenarios S1–S5 of the
+[design](protocol-r4-design.md#10-scenarios) are run by a client that is not the page,
+`scripts/reference-client-smoke.ts`, against a real server:
+
+| Scenario | Observation required |
+| --- | --- |
+| S1 stream | the device holds the latest output as a window of `N = 4096` and the operation head; a 1 MiB output reaches it verified at a checkpoint; no event carries `N + L` bytes of the window's text, none is held beyond it, and applying an event needs under `2(N + L)` bytes of text |
+| S1 poll | a device without a stream asks the same paths with `GET /nodes/…`, holds the same content at the same version, and is told `unchanged` when nothing changed |
+| S2 | the window is the end of the desktop's latest message: equal length, and `offset` is the bytes before it |
+| S3 | a request repeated with its own `id` and `expect` answers `202` with the same operation and the prompt runs once |
+| S4 | two prompts with the same `expect`: one `202`, the other `stale`, whose outcome is `superseded` |
+| S5 | two answers to one interaction: one delivered, one refused; a `cancel` against the running prompt is admitted and the prompt ends |
+
 ## Acceptance
 
 Each rule gets tests at the bridge first and then in the client engine. Document
