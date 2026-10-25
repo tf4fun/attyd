@@ -99,6 +99,18 @@ drops that path and requests a full snapshot without its `have`.
 | Older full and differential snapshots neither roll back the value/version nor clear its verification | [tests/tree-replica.test.ts](../tests/tree-replica.test.ts): `keeps a newer verified replica when an older snapshot carries a different hash` |
 | After warming the text-chain cache, a corrupt append followed by a disconnect before the checkpoint is detected by the reconnect's `same` snapshot; a full snapshot repairs it without a later update or checkpoint | [tests/tree-feed.test.ts](../tests/tree-feed.test.ts): `repairs a corrupted append on reconnect even when no later change or checkpoint arrives` |
 
+Fixed-view end delivery through slow-stream catch-up (#224, P2-2) is covered by
+`protocol::feed::tree_stream_tests::fixed_ends` in
+[fixed_ends.rs](../src/protocol/feed/tree_stream_tests/fixed_ends.rs). These gates use
+the real registry, view projection, feed and subscriber. An active entries path exceeds
+the queue budget and triggers the feed's automatic coalescing; the resulting catch-up
+is coalesced again before delivery to check that its pending ends are still owed.
+
+| Boundary | Gate |
+| --- | --- |
+| Initial fixed-view `absent` and `replaced` ends survive the real budget overflow and repeated coalescing when the first event is unwritten; the catch-up still names the instance. Already written ends are not sent again on later traffic | `initial_fixed_view_ends_survive_catch_up_only_until_they_are_written` |
+| Replacing a history preserves its fixed view's final `replaced` end through overflow and repeated coalescing, whether its initial snapshot was written or still queued. The old output is removed, and an ordinary session path on the same stream can close and reopen without reviving or repeating the fixed view | `a_fixed_view_replaced_after_alignment_keeps_its_end_while_session_paths_can_reopen` |
+
 The reference client's memory figures count UTF-8 window text, not the actual heap used
 by parsed JSON and replica copies. View polling below the 30-second `VIEW_LINGER` can
 receive `unchanged`; after eviction it receives a full snapshot again. These are the

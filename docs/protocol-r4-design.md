@@ -469,6 +469,8 @@ interface TextWindow {
 - **Slow subscriber**: when a stream's queue exceeds its budget, the bridge drops the
   queued events and queues one catch-up event at the current `rev` carrying, per followed
   path, a differential snapshot from the last `v_p` it actually wrote. Ends are kept.
+  A fixed view's queued final end is kept even though the view is no longer tracked;
+  once that end has been written to the stream, coalescing does not emit it again.
   Coalescing never changes what a path version contains.
 - An SSE comment at least every 15 s on an idle stream.
 
