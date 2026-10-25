@@ -1,6 +1,6 @@
 //! Admission of operation writes (protocol §6.4).
 //!
-//! A write is checked against the published documents, which are the bridge
+//! A write is checked against the published tree, which is the bridge
 //! state as of its last commit: the bridge checks it inside the guard that
 //! installs it, and without an Agent connection the server checks it the same
 //! way before it answers `unavailable`. The checks run in §6.4's order:
@@ -13,11 +13,27 @@ use serde_json::{Value, json};
 
 use super::canon::AttachmentRef;
 use super::documents::{ErrorCode, OperationKind, ProtocolError, Scope};
+use super::tree::{Node, Tree};
 
-/// The committed `live` of a scope.
-pub(crate) type LiveOf<'a> = &'a dyn Fn(&Scope) -> Option<Value>;
 /// The block an attachment of a session names: `(session ID, attachment ID)`.
 pub(crate) type AttachmentOf<'a> = &'a dyn Fn(&str, &str) -> Option<Value>;
+
+/// The committed target, borrowed without rebuilding its entries or other children.
+pub(crate) fn target<'a>(tree: &'a Tree, scope: &Scope) -> Option<&'a Node> {
+    match scope {
+        Scope::Global => tree.get("/global"),
+        Scope::Catalog => tree.get("/catalog"),
+        Scope::Session(id) => tree.get("/sessions")?.child(id),
+    }
+}
+
+fn operation(target: &Node) -> &Value {
+    target
+        .child("op")
+        .and_then(Node::as_value)
+        .map(|(value, _)| value)
+        .unwrap_or(&Value::Null)
+}
 
 /// `POST /api/v2/scopes/{scope}/ops` (protocol §6.1).
 #[derive(Debug, Clone)]
@@ -90,9 +106,9 @@ fn started_kind(scope: &Scope, kind: &str) -> Option<OperationKind> {
     Some(kind)
 }
 
-/// Checks `write` in `scope` against the published documents.
+/// Checks `write` in `scope` against the committed target's head and control fields.
 pub(crate) fn admit(
-    live_of: LiveOf,
+    tree: &Tree,
     attachment_of: AttachmentOf,
     scope: &Scope,
     write: &OpWrite,
@@ -111,9 +127,9 @@ pub(crate) fn admit(
             "an operation ID is 22 characters of base64url, not {id:?}"
         )));
     }
-    let live = live_of(scope)
+    let held = target(tree, scope)
         .ok_or_else(|| refuse(ErrorCode::NotFound, format!("{scope} is not held")))?;
-    let op = &live["op"];
+    let op = operation(held);
     // A write whose ID is the current operation's repeats one whose answer was
     // lost: accepted again, before `expect` is judged (protocol §6.4, §6.6).
     if started.is_some()
@@ -161,8 +177,10 @@ pub(crate) fn admit(
     }
     if kind == OperationKind::Delete
         && let Some(session_id) = write.args["sessionId"].as_str()
-        && live_of(&Scope::Session(session_id.to_string()))
-            .is_some_and(|session| session["op"]["status"] == "running")
+        && tree
+            .get("/sessions")
+            .and_then(|sessions| sessions.child(session_id))
+            .is_some_and(|session| operation(session)["status"] == "running")
     {
         return Err(refuse(
             ErrorCode::NotAllowed,
@@ -171,21 +189,23 @@ pub(crate) fn admit(
     }
     // A fork is recorded only in its source session. Admission excludes both global writes
     // and other forks while it runs, so pre-installation messages have one owner (§9).
-    let global = live_of(&Scope::Global);
+    let global = target(tree, &Scope::Global);
     if kind == OperationKind::Fork
-        && global
-            .as_ref()
-            .is_some_and(|global| global["op"]["status"] == "running")
+        && global.is_some_and(|global| operation(global)["status"] == "running")
     {
         return Err(refuse(ErrorCode::NotAllowed, "global is not free"));
     }
     if (matches!(scope, Scope::Global) || kind == OperationKind::Fork)
         && global
-            .as_ref()
-            .and_then(|global| global["sessions"].as_object())
+            .and_then(|global| global.child("sessions"))
             .is_some_and(|sessions| {
-                sessions.values().any(|session| {
-                    session["op"]["kind"] == "fork" && session["op"]["status"] == "running"
+                sessions.child_names().into_iter().any(|id| {
+                    sessions
+                        .child(id)
+                        .and_then(Node::as_value)
+                        .is_some_and(|(session, _)| {
+                            session["op"]["kind"] == "fork" && session["op"]["status"] == "running"
+                        })
                 })
             })
     {
@@ -195,11 +215,18 @@ pub(crate) fn admit(
         ));
     }
     let initialize = global
-        .as_ref()
-        .map(|global| &global["agent"]["initialize"])
+        .and_then(|global| global.field("agent"))
+        .and_then(|agent| agent.get("initialize"))
         .filter(|initialize| !initialize.is_null());
     capability(initialize, kind)?;
-    let input = arguments(attachment_of, initialize, scope, &live, kind, &write.args)?;
+    let input = arguments(
+        attachment_of,
+        initialize,
+        scope,
+        held.field("revision").and_then(Value::as_str),
+        kind,
+        &write.args,
+    )?;
     Ok(Admitted::Start {
         kind,
         input,
@@ -300,7 +327,7 @@ fn arguments(
     attachment_of: AttachmentOf,
     initialize: Option<&Value>,
     scope: &Scope,
-    live: &Value,
+    catalog_revision: Option<&str>,
     kind: OperationKind,
     args: &Value,
 ) -> Result<Value, ProtocolError> {
@@ -359,7 +386,7 @@ fn arguments(
         OperationKind::List => {
             let cursor = optional_string(args, "cursor")?;
             if let Some(revision) = optional_string(args, "revision")?
-                && live["revision"].as_str() != Some(revision)
+                && catalog_revision != Some(revision)
             {
                 return Err(refuse(
                     ErrorCode::CatalogChanged,
@@ -432,3 +459,6 @@ fn prompt_capabilities(initialize: Option<&Value>, prompt: &[Value]) -> Result<(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

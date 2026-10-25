@@ -45,10 +45,12 @@ pub(super) fn admit(
     }
     let shown = {
         let published = state.protocol.publication.lock();
-        published
-            .feed
-            .live(&scope)
-            .map(|live| (live["op"]["kind"].clone(), live["op"]["status"].clone()))
+        published.feed.with_tree(|tree| {
+            crate::protocol::admission::target(tree, &scope)
+                .and_then(|target| target.child("op"))
+                .and_then(|op| op.as_value())
+                .map(|(op, _)| (op["kind"].clone(), op["status"].clone()))
+        })
     };
     let running_other = |kind: &Value| match control {
         // A close may interrupt a running prompt, and nothing else (protocol §7).

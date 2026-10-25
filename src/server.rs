@@ -364,7 +364,7 @@ impl BridgeHub {
 
     /// An operation write (protocol §6): the bridge admits it under one
     /// guard. Without an Agent connection the same checks run on the published
-    /// documents, and an admissible write is `unavailable`; nothing starts a
+    /// tree, and an admissible write is `unavailable`; nothing starts a
     /// connection.
     async fn operate(
         &self,
@@ -386,12 +386,14 @@ impl BridgeHub {
             }
         }
         let published = self.publication.lock();
-        admission::admit(
-            &|scope| published.feed.live(scope),
-            &|session, id| published.feed.attachment(session, id),
-            &scope,
-            &write,
-        )?;
+        published.feed.with_state(|tree, projector| {
+            admission::admit(
+                tree,
+                &|session, id| projector.attachment(session, id).cloned(),
+                &scope,
+                &write,
+            )
+        })?;
         Err(ProtocolError::new(
             ErrorCode::Unavailable,
             "there is no Agent connection",
@@ -705,13 +707,10 @@ async fn read_session(
         return invalid_request(format!("{attachment_id} is not an attachment ID"));
     }
     let session = Scope::Session(session_id.to_string());
-    let held = state
-        .bridge
-        .publication
-        .lock()
-        .feed
-        .live(&session)
-        .is_some();
+    let held = {
+        let published = state.bridge.publication.lock();
+        published.feed.with_tree(|tree| admission::target(tree, &session).is_some())
+    };
     let scope = session.to_string();
     let unheld = || {
         refused(ProtocolError::new(

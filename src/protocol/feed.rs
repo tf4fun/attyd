@@ -282,7 +282,7 @@ impl Feed {
 
     /// The block an attachment of a held session names, while a published entry references it.
     pub(crate) fn attachment(&self, session_id: &str, id: &str) -> Option<Value> {
-        self.engine.attachment(&format!("session/{session_id}"), id).cloned()
+        self.projector.attachment(session_id, id).cloned()
     }
 
     /// The whole document of `scope`, as a snapshot from nothing.
@@ -578,6 +578,13 @@ impl FeedHandle {
     /// `read` over the tree as committed now.
     pub(crate) fn with_tree<R>(&self, read: impl FnOnce(&Tree) -> R) -> R {
         read(self.feed().tree())
+    }
+
+    /// Reads the committed tree and its attachment index under one lock. A caller must not
+    /// re-enter the handle while reading; the two borrowed values belong to the same commit.
+    pub(crate) fn with_state<R>(&self, read: impl FnOnce(&Tree, &Projector) -> R) -> R {
+        let feed = self.feed();
+        read(&feed.tree, &feed.projector)
     }
 
     /// A short subscription for a read: its views are kept for a while.

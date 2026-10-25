@@ -245,6 +245,33 @@ fn an_unknown_history_has_no_entries_and_no_history() {
 }
 
 #[test]
+fn an_empty_known_history_has_empty_entries_and_prompts() {
+    let session = at(&tree_of(&registry()), "/sessions/s");
+    assert_eq!(session["history"], "complete");
+    assert_eq!(session["entries"], json!([]));
+    assert_eq!(session["prompts"], json!([]));
+}
+
+#[test]
+fn history_prompts_and_their_outcomes_are_published() {
+    let mut registry = registry();
+    let state = &mut registry.sessions.get_mut("s").unwrap().state;
+    state.history = Some(super::super::timeline::History::Partial);
+    let timeline = Arc::make_mut(state.timeline.as_mut().unwrap());
+    timeline.begin_prompt(&[text_block("hi")]);
+    timeline.end_prompt(PromptEnd::Response(json!({ "stopReason": "end_turn" })));
+    timeline.begin_prompt(&[text_block("again")]);
+    timeline.end_prompt(PromptEnd::Interrupted(true));
+    let session = at(&tree_of(&registry), "/sessions/s");
+    assert_eq!(session["history"], "partial");
+    assert_eq!(session["entries"].as_array().unwrap().len(), 2);
+    assert_eq!(session["prompts"], json!([
+        { "entry": 0, "end": { "response": { "stopReason": "end_turn" } } },
+        { "entry": 1, "end": { "interrupted": true } },
+    ]));
+}
+
+#[test]
 fn turn_heads_and_prompts_that_did_not_change_keep_the_value_they_were_published_as() {
     let mut registry = registry();
     for n in 0..3 {
@@ -356,6 +383,108 @@ fn a_replaced_history_replaces_the_entries_and_a_released_session_forgets_them()
         crate::runtime_state::SessionLifecycle::Closed;
     projector.project(&registry, &agent(), 1, 1);
     assert!(!projector.sessions.contains_key("s"));
+}
+
+fn image(data: &str) -> Value {
+    json!({ "type": "image", "data": data, "mimeType": "image/png" })
+}
+
+fn tool_content(blocks: &[Value]) -> Vec<Value> {
+    blocks.iter().map(|block| json!({ "type": "content", "content": block })).collect()
+}
+
+#[test]
+fn attachments_follow_entries_across_reuse_and_content_replacement() {
+    let mut registry = registry();
+    let (a, b) = (image("AAAA"), image("BBBB"));
+    let id = super::super::timeline_doc::attachment_id;
+    for (tool, blocks) in [("t1", vec![a.clone(), a.clone()]), ("t2", vec![a.clone()])] {
+        registry.append_session_update("s", json!({ "sessionUpdate": "tool_call",
+            "toolCallId": tool, "title": "shot", "content": tool_content(&blocks) })).unwrap();
+    }
+    let (mut projector, mut tree) = (Projector::default(), Tree::new("i"));
+    project_at(&mut projector, &mut tree, &registry).unwrap();
+    assert_eq!(at(&tree, "/sessions/s/entries/0")["call"]["content"][0]["content"]["id"], id(&a));
+    assert_eq!(projector.attachment("s", &id(&a)), Some(&a));
+    assert_eq!(projector.attachment("s", "unknown"), None);
+    assert_eq!(projector.attachment("other", &id(&a)), None);
+    assert_eq!(projector.sessions["s"].attachments.len(), 1, "duplicate references share one block");
+
+    // Reusing an unchanged published entry must not count its references again.
+    project_at(&mut projector, &mut tree, &registry);
+    project_at(&mut projector, &mut tree, &registry);
+    for (tool, blocks, a_held, b_held) in [
+        ("t1", vec![a.clone(), b.clone()], true, true),
+        ("t1", vec![b.clone()], true, true),
+        ("t2", vec![], false, true),
+        ("t1", vec![], false, false),
+    ] {
+        registry.append_session_update("s", json!({ "sessionUpdate": "tool_call_update",
+            "toolCallId": tool, "content": tool_content(&blocks) })).unwrap();
+        project_at(&mut projector, &mut tree, &registry).unwrap();
+        assert_eq!(projector.attachment("s", &id(&a)), a_held.then_some(&a));
+        assert_eq!(projector.attachment("s", &id(&b)), b_held.then_some(&b));
+    }
+    assert_eq!(projector.sessions["s"].attachments.len(), 0);
+}
+
+#[test]
+fn a_load_changes_served_attachments_only_when_its_history_is_installed() {
+    let mut registry = registry();
+    let (a, b, candidate) = (image("AAAA"), image("BBBB"), image("CCCC"));
+    let id = super::super::timeline_doc::attachment_id;
+    for (tool, block) in [("t1", &a), ("t2", &b)] {
+        registry.append_session_update("s", json!({ "sessionUpdate": "tool_call",
+            "toolCallId": tool, "title": "shot", "content": tool_content(&[block.clone()]) })).unwrap();
+    }
+    let (mut projector, mut tree) = (Projector::default(), Tree::new("i"));
+    project_at(&mut projector, &mut tree, &registry).unwrap();
+    for attempt in ["failed", "installed"] {
+        registry.begin_load("s", attempt).unwrap();
+        registry.append_load_update("s", attempt, json!({ "sessionUpdate": "agent_message_chunk",
+            "messageId": "replayed", "content": candidate })).unwrap();
+        project_at(&mut projector, &mut tree, &registry);
+        assert_eq!(projector.attachment("s", &id(&a)), Some(&a));
+        assert_eq!(projector.attachment("s", &id(&b)), Some(&b));
+        assert_eq!(projector.attachment("s", &id(&candidate)), None, "a private candidate is not served");
+        if attempt == "failed" {
+            registry.fail_load("s", attempt, "load failed", true).unwrap();
+            project_at(&mut projector, &mut tree, &registry);
+            assert_eq!(projector.attachment("s", &id(&a)), Some(&a));
+            assert_eq!(projector.attachment("s", &id(&b)), Some(&b));
+            assert_eq!(projector.attachment("s", &id(&candidate)), None);
+        } else {
+            registry.commit_load("s", attempt).unwrap();
+            project_at(&mut projector, &mut tree, &registry).unwrap();
+        }
+    }
+    assert_eq!(at(&tree, "/sessions/s/entries").as_array().unwrap().len(), 1);
+    assert_eq!(projector.attachment("s", &id(&a)), None, "the replaced entry no longer references it");
+    assert_eq!(projector.attachment("s", &id(&b)), None, "the removed trailing entry releases it");
+    assert_eq!(projector.attachment("s", &id(&candidate)), Some(&candidate));
+}
+
+#[test]
+fn forgetting_a_history_or_releasing_a_session_releases_only_its_attachments() {
+    let mut registry = registry();
+    registry.open_new("epoch", "other", "/work", json!({ "sessionId": "other" })).unwrap();
+    let block = image("AAAA");
+    let id = super::super::timeline_doc::attachment_id(&block);
+    for session in ["s", "other"] {
+        registry.append_session_update(session, json!({ "sessionUpdate": "agent_message_chunk",
+            "content": block })).unwrap();
+    }
+    let (mut projector, mut tree) = (Projector::default(), Tree::new("i"));
+    project_at(&mut projector, &mut tree, &registry).unwrap();
+    registry.register_cold("s");
+    project_at(&mut projector, &mut tree, &registry).unwrap();
+    assert_eq!(projector.attachment("s", &id), None);
+    assert_eq!(projector.attachment("other", &id), Some(&block));
+    registry.sessions.get_mut("other").unwrap().state.live.as_mut().unwrap().lifecycle =
+        crate::runtime_state::SessionLifecycle::Closed;
+    project_at(&mut projector, &mut tree, &registry).unwrap();
+    assert_eq!(projector.attachment("other", &id), None);
+    assert!(!projector.sessions.contains_key("other"));
 }
 
 // --- historyRev and heldSince (§4.2) -------------------------------------------------
