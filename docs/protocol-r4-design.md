@@ -577,8 +577,10 @@ interface OpRecord {
 ```
 
 Every target keeps `ops`: the records of the last `K = 64` operations that occupied it,
-**including those written to another target** (a `fork` written to a session is recorded
-in the session and in `global`, each with its own `after`). Within the window, each
+**including those written to another target** (a `delete` written to `global` is recorded
+in `global` and in the held session it occupies, each with its own `after`). A `fork` is
+recorded only in its source session; admission excludes global writes and other forks
+while it runs. Within the window, each
 target's log is the complete chain of its `op`s. A target's log lives as long as the
 target: releasing a session and holding it again starts an empty log.
 
@@ -671,7 +673,10 @@ values of the Agent's size, so a device that cannot hold them does not offer ans
 | paging a long text | one segment | — | the chain, one segment at a time |
 
 Peak memory claims are to be measured, not assumed: plan step 8 runs a minimal reference
-client through receive, parse, verify and install, and records its peak.
+client through receive, parse, verify and install, and records its peak. What the reference
+client counts is the UTF-8 bytes of window text held and carried by an event, a stand-in for
+the peak: it does not count the parsed JSON of an event or the copy applying it makes, which
+the `2 (N + L)` bound includes only as text. A device's real peak is measured on the device.
 
 The bridge keeps per node `rev`, `srev` and a cached hash, per materialized view its value
 (text shared with the entry where it is one block), and per target `K` small records.
@@ -754,8 +759,8 @@ Acceptance cases to add to [protocol-acceptance](protocol-acceptance.md):
 - a delayed request: the query answers `open` while `op.id == e`, the client repeats
   `(x, e)`, the delayed copy is then a no-op, and exactly one prompt runs; `superseded`
   is the only outcome after which a new request is made;
-- every row of §9.3, including a `fork` lost while another operation replaced `global`'s
-  `op`, and a session released and held again (`released`);
+- every row of §9.3, including a lost `fork` answer resolved from its source session's
+  log after another session operation, and a session released and held again (`released`);
 - a late `GET` answered by an old instance after the client adopted a new one is not
   installed;
 - a polling-only client opens an unheld session, keeps it held while polling, and it is

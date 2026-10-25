@@ -405,7 +405,7 @@
    }
   },
   {
-   "name": "the lost fork answer: global's op was replaced while the request was lost",
+   "name": "a lost answer: global's op was replaced while the request was lost",
    "target": {
     "instance": "I",
     "op": "authenticate-2",
@@ -413,6 +413,57 @@
     "ops": [
      {
       "id": "authenticate-2",
+      "after": "e"
+     }
+    ]
+   },
+   "request": {
+    "id": "create-1",
+    "expect": "e",
+    "instance": "I",
+    "at": 10
+   },
+   "expected": {
+    "outcome": "superseded"
+   }
+  },
+  {
+   "name": "a lost fork answer: the source retains the fork after a later prompt",
+   "target": {
+    "instance": "I",
+    "op": "prompt-2",
+    "heldSince": null,
+    "ops": [
+     {
+      "id": "fork-1",
+      "after": "e"
+     },
+     {
+      "id": "prompt-2",
+      "after": "fork-1"
+     }
+    ]
+   },
+   "request": {
+    "id": "fork-1",
+    "expect": "e",
+    "instance": "I",
+    "at": 10
+   },
+   "expected": {
+    "outcome": "admitted",
+    "record": "fork-1"
+   }
+  },
+  {
+   "name": "a lost fork request: another prompt replaced the source's expected op",
+   "target": {
+    "instance": "I",
+    "op": "prompt-1",
+    "heldSince": null,
+    "ops": [
+     {
+      "id": "prompt-1",
       "after": "e"
      }
     ]

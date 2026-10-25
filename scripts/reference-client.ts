@@ -9,6 +9,7 @@
 // `2 (window + L)` bytes of text, whatever the output's length.
 
 import { newOperationId } from "../shared/write-resolution.js";
+import { RequestOrder } from "../shared/request-order.js";
 import { isTextWindow } from "../shared/tree-hash.js";
 import { TreeFeedClient, type StreamSource } from "../shared/tree-feed.js";
 import { TreeReplicaSet, type Change, type Follow, type PathReplica, type TreeEvent } from "../shared/tree-replica.js";
@@ -62,13 +63,17 @@ export class ReferenceClient {
   readonly #follow: readonly Follow[];
   readonly #feed: TreeFeedClient;
   readonly #set = new TreeReplicaSet("/api/v2/stream");
+  /** Which answers of a poll may be installed (design §7.3). */
+  readonly #order = new RequestOrder();
+  readonly #fetch: typeof fetch;
   #held = 0;
 
   constructor(
     readonly origin: string,
     readonly session: string,
-    options: { window?: number; cwd?: string } = {},
+    options: { window?: number; cwd?: string; fetch?: typeof fetch } = {},
   ) {
+    this.#fetch = options.fetch ?? ((input, init) => globalThis.fetch(input, init));
     this.#follow = [
       { path: this.outputPath, window: options.window ?? 4096, ...(options.cwd === undefined ? {} : { cwd: options.cwd }) },
       { path: this.opPath },
@@ -101,21 +106,35 @@ export class ReferenceClient {
   async poll(): Promise<"changed" | "unchanged"> {
     let changed = false;
     for (const follow of this.#follow) {
-      const { stream, url } = this.#set.open([follow]);
-      const asked = new URL(url, this.origin).searchParams;
+      const ticket = this.#order.issue();
       const node = new URL(`/api/v2/nodes${follow.path}`, this.origin);
-      for (const key of ["instance", "window", "cwd"] as const) {
-        const value = asked.get(key);
-        if (value !== null) node.searchParams.set(key, key === "window" ? value.slice(value.lastIndexOf(":") + 1) : value);
+      const held = this.#set.get(follow.path);
+      if (held !== undefined && this.#set.instance !== undefined) {
+        node.searchParams.set("instance", this.#set.instance);
+        node.searchParams.set("have", String(held.version));
       }
-      const have = asked.getAll("have").find((entry) => entry.startsWith(`${follow.path}:`));
-      if (have !== undefined) node.searchParams.set("have", have.slice(follow.path.length + 1));
-      const response = await fetch(node);
+      if (follow.window !== undefined) node.searchParams.set("window", String(follow.window));
+      if (follow.cwd !== undefined) node.searchParams.set("cwd", follow.cwd);
+      const response = await this.#fetch(node);
       if (response.status !== 200) throw new Error(`${node.pathname} returned ${response.status}: ${await response.text()}`);
       const answer = await response.json() as { instance: string; rev: number; unchanged?: true; change?: Change };
       if (answer.unchanged === true || answer.change === undefined) continue;
+      // A path the client reads but does not follow on a stream: installed only if the instance it
+      // was issued under is still the one adopted, and its version is newer than the one held.
+      const version = "snapshot" in answer.change ? answer.change.snapshot.at : answer.rev;
+      const decision = this.#order.decide(ticket, { instance: answer.instance, version }, this.#replica(follow.path)?.version ?? null, false);
+      if (decision === "discard") continue;
+      // A concurrent read may already have advanced this path since the request's `have`.
+      // Its differential snapshot cannot be applied to that newer base. The next poll asks
+      // from the version now held; this is ordinary request ordering, not corrupt content.
+      if (decision === "install" && "snapshot" in answer.change && answer.change.snapshot.base !== null &&
+          answer.change.snapshot.base !== this.#set.get(follow.path)?.version) continue;
+      if (decision === "adopt-and-install") this.#order.adopt(answer.instance);
       const event: TreeEvent = { instance: answer.instance, rev: answer.rev, changes: [answer.change] };
       this.#measure(JSON.stringify(event), event);
+      // Polls may overlap: their arrival order is governed above, not by a stream ID allocated
+      // when the request was sent. Open the application scope only after accepting the answer.
+      const { stream } = this.#set.open(this.#follow);
       const result = this.#set.receive(stream, event);
       if (result.kind === "resubscribe") throw new Error(`the answer for ${follow.path} could not be applied: ${this.#set.lastResubscribe?.reason}`);
       this.#heldAfter();

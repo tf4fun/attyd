@@ -66,6 +66,21 @@ failure paths; `src/protocol/tree_doc/tests.rs` checks the invariant assertion.
 
 ## Acceptance
 
+Revision 4 review boundaries (#216) have these concrete gates in addition to S1–S5:
+
+| Boundary | Gate |
+| --- | --- |
+| A lost fork answer stays resolvable in its source after a later prompt; `global.op` and `global.ops` do not acquire the fork | `server::stream_tests::tree::a_lost_fork_answer_is_resolved_on_its_source_after_another_operation`, plus shared Rust/TypeScript outcome vectors |
+| Forks from different source sessions cannot install together; a refused fork changes nothing and is accepted after the first ends | `server::stream_tests::bench::admission::forks_of_different_sessions_cannot_install_together` |
+| Poll replies from an abandoned instance or an older path version never replace current state; overlapping differential replies use the base still held | `tests/reference-client.test.ts` |
+| A cold polling read sends the directory as `cwd`, without the stream query's session prefix | `tests/reference-client.test.ts` |
+| A non-node `follow` or `GET` is refused before observing or loading its session | `server::stream_tests::tree::non_node_paths_are_refused_before_a_session_is_loaded_or_observed` |
+
+The reference client's memory figures count UTF-8 window text, not the actual heap used
+by parsed JSON and replica copies. View polling below the 30-second `VIEW_LINGER` can
+receive `unchanged`; after eviction it receives a full snapshot again. These are the
+measurement and retention limits described in the design §11 and protocol §7.1.
+
 Each rule gets tests at the bridge first and then in the client engine. Document
 consistency is checked after **every** event, not only once synchronization ends.
 Revision 2 adds a second kind of check: a replica that equals the bridge's projection

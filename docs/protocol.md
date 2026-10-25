@@ -467,8 +467,10 @@ interface Interaction {
 Scopes and lifetimes are memory model §8.2. An interaction is shown in the
 `interactions` node of its target: its session; for a request-scoped elicitation, the
 target of the write or load that sent the request (`global` when none did); for a session
-being installed, the target of the installing operation (`global`, which also runs `fork`,
-memory model §9) until installation, when it moves into `sessions/<id>`.
+being installed, `global` stages session-scoped interactions until installation, when
+they move into `sessions/<id>`. This staging does not change `global.op` during a fork;
+the fork operation and its request-scoped elicitations belong to the source session
+(memory model §9).
 
 ### 4.5 Controls
 
@@ -731,7 +733,7 @@ the last request asks what became of a write (§6.6).
 | Target | Kind | `args` | Occupies | Allowed while | Result |
 | --- | --- | --- | --- | --- | --- |
 | `sessions/<id>` | `prompt` | `{ prompt: PromptBlock[] }` | the session | `op` ended, not `closing` | `{ stopReason, usage? }` |
-| `sessions/<id>` | `fork` | `{ cwd? }` (default: the source's `cwd`) | the source and `global` (memory model §9) | `op` ended, `global` free | `{ sessionId }` |
+| `sessions/<id>` | `fork` | `{ cwd? }` (default: the source's `cwd`) | the source; excludes writes to `global` and other forks while it runs | `op` ended, `global`'s `op` ended, no fork running | `{ sessionId }` |
 | `global` | `create` | `{ cwd }` | `global` | `op` ended | `{ sessionId }` |
 | `global` | `delete` | `{ sessionId }` | `global`, `sessions/<sessionId>` | `op` ended, the session free | `{}` |
 | `global` | `authenticate` | `{ methodId }` | `global` | `op` ended | `{}` |
@@ -749,7 +751,9 @@ the last request asks what became of a write (§6.6).
   changes nothing; the operation keeps its scopes until it actually ends. A cancel is
   not an operation of its own: its `id` is ignored and `op` is unchanged.
 - **Fork** and **create** install the returned session (memory model §6.3, §9); its
-  summary carries `origin`, the operation's `id`.
+  summary carries `origin`, the operation's `id`. Only one installation runs: admission
+  refuses a global write or another session's fork while a fork runs, without replacing
+  `global.op` or adding a fork to `global.ops`.
 - **Delete** closes a held session (`session/close`, when advertised), deletes it
   (`session/delete`), and ends the paths of `/sessions/<sessionId>` with `deleted`. It needs the
   Agent's delete capability and works on sessions the bridge does not hold.
@@ -821,8 +825,9 @@ interface OpRecord {
 ```
 
 Every target keeps `ops`: the records of the last `K = 64` operations that occupied it,
-**including those written to another target** (a `fork` written to a session is recorded
-in the session and in `global`, each with its own `after`). Within the window, each
+**including those written to another target** (a `delete` written to `global` is recorded
+in `global` and in the session it occupies, each with its own `after`; a `fork` is shown
+and recorded only in its source session, and excludes writes to `global` while it runs). Within the window, each
 target's log is the complete chain of its `op`s. A target's log lives as long as the
 target: releasing a session and holding it again starts an empty log.
 
@@ -917,7 +922,10 @@ is a §10 error (`404` when the target does not exist).
 
 **Polling.** A client that cannot keep a stream polls `GET /nodes/{path}?have=` with its
 path version; it gets a differential snapshot or `unchanged`. Updates between polls are
-coalesced, which R2 allows; latency is the polling interval.
+coalesced, which R2 allows; latency is the polling interval. A view a read materialized
+lingers for 30 s, so a client polling a view more often than that finds the same path
+version and is told `unchanged`; a slower one finds the view materialized anew at a later
+version and receives a whole snapshot each time (correct, but not cheap).
 
 **Paging a long text.** A device reads segments `0, 1, …` with `at` set to the version it
 holds, chaining `c_i`, and checks the chain against its window's `before`, or the whole
@@ -1095,7 +1103,7 @@ decode, apply, verify and install steps.
 | Turn index | a partition change rewrites only the index; a fixed view ends `absent`; a load ends fixed views `replaced`, also after a resubscription without `have` |
 | Text windows | a 1 MiB append arrives as one window of at most `N + L` bytes that verifies from its 32-byte `before`; 1 byte then 12,000 bytes at `N = 4096` is a `set`; a stale segment read is refused |
 | Several clients | two followers at one version have equal hashes; their writes race as §6.6 states; two answers to one interaction deliver exactly one |
-| Lost write answers | each row of §6.6, including a lost `create` resolved by `origin`, a `fork` lost while another operation replaced `global`'s `op`, and a session released and held again (`released`); a delete that occupied a session and failed leaves its `op` in the session, so a request that expected the replaced `op` is `superseded` and no `op.id` returns; only `superseded` allows a new request |
+| Lost write answers | each row of §6.6, including a lost `create` resolved by `origin`, a lost `fork` resolved from its source session's log after another operation, a write lost while another operation replaced `global`'s `op`, and a session released and held again (`released`); a delete that occupied a session and failed leaves its `op` in the session, so a request that expected the replaced `op` is `superseded` and no `op.id` returns; only `superseded` allows a new request |
 | A delayed request | the query answers `open` while `op.id == e`; the repeat of `(x, e)` is admitted or a no-op; exactly one prompt runs |
 | Bounded heads | with a 1 MiB Agent error, `OpHead`, `OpRecord` and `End` stay bounded |
 | Reconnect races | a superseded stream's late events cannot overwrite a newer replica; a late `GET` of an old instance is not installed (§8.3) |

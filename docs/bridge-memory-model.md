@@ -432,8 +432,10 @@ keep it needed.
 
 ## 9. Concurrency
 
-- **One installation at a time.** `create` and `fork` both use the global operation
-  slot, so at most one session is being installed at any moment. A resource naming a
+- **One installation at a time.** Admission makes `create` and all sessions' `fork`s
+  mutually exclusive. `create` is recorded in `global`; `fork` is recorded only in its
+  source session and excludes global writes and other forks until it ends. Thus at most
+  one session is being installed at any moment. A resource naming a
   session ID the bridge does not hold yet, arriving while an installation runs, belongs
   to that installation: an interaction or URL flow is shown there and moves into the
   session when installed, or is cancelled if installation fails; a timeline or control
