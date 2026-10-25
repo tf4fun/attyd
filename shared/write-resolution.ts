@@ -3,7 +3,7 @@
 // path version of the target it held, the target's `op` and its log of operations (`outcome.ts`),
 // it learns whether a write was admitted without keeping a table of past requests.
 
-import { outcome, type TargetState } from "./outcome";
+import { next, outcome, type Next, type TargetState } from "./outcome";
 
 /** A write to the operations of `scope`: the ID it chose, the operation it expected and what the client held. */
 export interface Write {
@@ -57,6 +57,20 @@ export function resolveWrite(write: Write, target: TargetState | undefined): Res
     default:
       return "unknown";
   }
+}
+
+/**
+ * What a client may do next with `write`, whose answer was lost (design §9.3): `superseded` alone
+ * allows a new request, `open` only the same one unchanged, `unknown` is left to the user.
+ */
+export function nextStep(write: Write, target: TargetState | undefined): Next {
+  if (target === undefined) return "ask-the-user";
+  return next(outcome(target, {
+    id: write.id,
+    expect: write.expect,
+    instance: write.instance ?? target.instance,
+    at: write.at ?? 0,
+  }));
 }
 
 /** The session a `create` or `fork` with ID `id` installed, while the bridge holds it (§6.6). */

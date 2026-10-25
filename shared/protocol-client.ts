@@ -4,7 +4,9 @@
 // resent automatically (C3); queued input that was never sent, or was refused with a
 // definite answer, is submitted once the document shows the operation ended (C2).
 
+import type { Next } from "./outcome";
 import type { ErrorCode, OpArgs, Operation, ProtocolError } from "./protocol";
+import type { Write } from "./write-resolution";
 
 // ---------------------------------------------------------------------------
 // Transport
@@ -65,11 +67,16 @@ export function refusal(status: number, body: unknown): { kind: "refused"; error
  */
 export interface QueueOps {
   write(scope: string, write: StartingWrite): Promise<QueueOutcome>;
+  /** What may be done next with a write whose answer was lost, from the target's log (§9.3). */
+  nextStep?(write: Write): Next;
+  /** Sends `write` again with its own `id` and `expect`. */
+  repeat?(write: Write, args: StartingWrite): Promise<QueueOutcome>;
 }
 
 /** The outcomes of a write as the queue reads them. */
 export type QueueOutcome =
-  | { readonly kind: "accepted" | "ended" | "uncertain" }
+  | { readonly kind: "accepted" | "ended" }
+  | { readonly kind: "uncertain"; readonly write?: Write }
   | { readonly kind: "refused"; readonly error: ProtocolError }
   | { readonly kind: "blocked"; readonly reason: string };
 
@@ -84,6 +91,8 @@ export interface QueuedWrite {
   readonly state: QueuedState;
   /** The refusal of a `refused` write. */
   readonly error?: ProtocolError;
+  /** The request of an `uncertain` write whose answer was lost, to settle from the target's log. */
+  readonly lost?: Write;
 }
 
 /**
@@ -122,10 +131,28 @@ export class WriteQueue {
   update(scope: string): void {
     const queue = this.#scopes.get(scope);
     if (queue === undefined || queue.sending !== undefined) return;
+    this.#settleLost(queue);
     const op = shownOp(this.#replicas, scope);
     // Once a write against an ended `op` was admitted, a second one against
     // it could only be refused as stale: wait for the replica to show another.
     if (op === undefined || op.status === "running" || op.id === queue.admitted) return;
+    // A write whose answer was lost and which may still be admitted is repeated unchanged, once per
+    // `op` shown (§9.3); the repeat is admitted now, or is a no-op if a delayed copy got there first.
+    const repeating = queue.items.find((item) => item.state === "uncertain" && item.lost !== undefined
+      && this.#ops.nextStep?.(item.lost) === "repeat-unchanged" && queue.repeated.get(item.id) !== op.id);
+    if (repeating?.lost !== undefined && this.#ops.repeat !== undefined) {
+      queue.repeated.set(repeating.id, op.id);
+      queue.sending = { id: repeating.id, expect: repeating.lost.expect };
+      queue.items = queue.items.map((item) => (item.id === repeating.id ? { ...item, state: "sending" } : item));
+      const lost = repeating.lost;
+      // A refusal of a repeat proves nothing about the original: only the log settles it.
+      void this.#ops.repeat(lost, repeating.write).then((outcome) => this.#answered(
+        scope,
+        repeating.id,
+        outcome.kind === "refused" || outcome.kind === "blocked" ? { kind: "uncertain", write: lost } : outcome,
+      ));
+      return;
+    }
     // Uncertain writes stay with the user and hold nothing back; the first
     // other write goes next, a refused one only against a later `op`.
     const index = queue.items.findIndex(({ state }) => state !== "uncertain");
@@ -135,6 +162,26 @@ export class WriteQueue {
     queue.items = replaced(queue.items, index, { id, write, state: "sending" });
     queue.sending = { id, expect: op.id };
     void this.#ops.write(scope, write).then((outcome) => this.#answered(scope, id, outcome));
+  }
+
+  /**
+   * Settles the uncertain writes whose request is known from the target's log: one admitted leaves
+   * the queue; one that can never be admitted is queued again, and is sent with a new id. Nothing
+   * else is decided here: the rest waits for a repeat or for the user.
+   */
+  #settleLost(queue: ScopeQueue): void {
+    if (this.#ops.nextStep === undefined) return;
+    for (const item of queue.items) {
+      if (item.state !== "uncertain" || item.lost === undefined) continue;
+      const step = this.#ops.nextStep(item.lost);
+      if (step === "done") {
+        queue.items = queue.items.filter((candidate) => candidate.id !== item.id);
+      } else if (step === "resubmit-with-new-id") {
+        queue.items = queue.items.map((candidate) => (candidate.id === item.id
+          ? { id: item.id, write: item.write, state: "queued" }
+          : candidate));
+      }
+    }
   }
 
   /** The user sends `id` again, as new input. */
@@ -160,7 +207,7 @@ export class WriteQueue {
   #queue(scope: string): ScopeQueue {
     let queue = this.#scopes.get(scope);
     if (queue === undefined) {
-      queue = { items: [], refused: new Map() };
+      queue = { items: [], refused: new Map(), repeated: new Map() };
       this.#scopes.set(scope, queue);
     }
     return queue;
@@ -187,7 +234,12 @@ export class WriteQueue {
       case "uncertain":
         // Only this input is uncertain: it is never sent again by itself, and
         // other input still competes for the `op`, the bridge's `expect` deciding.
-        queue.items = replaced(queue.items, index, { id, write, state: "uncertain" });
+        queue.items = replaced(queue.items, index, {
+          id,
+          write,
+          state: "uncertain",
+          ...(outcome.write === undefined ? {} : { lost: outcome.write }),
+        });
         break;
       case "blocked":
         queue.items = replaced(queue.items, index, { id, write, state: "queued" });
@@ -206,6 +258,8 @@ interface ScopeQueue {
   admitted?: string;
   /** The `op.id` each refused write was refused against. */
   refused: Map<number, string>;
+  /** The `op.id` a lost write was last repeated against. */
+  repeated: Map<number, string>;
 }
 
 function replaced<T>(items: readonly T[], index: number, item: T): readonly T[] {
