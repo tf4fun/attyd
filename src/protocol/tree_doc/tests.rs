@@ -540,6 +540,39 @@ fn an_operation_that_occupies_another_target_is_recorded_in_both_with_their_own_
 }
 
 #[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "operation ID returned in sessions/s")]
+fn a_target_cannot_return_to_its_recorded_predecessor() {
+    let registry = registry();
+    let (mut operation, _) =
+        project::shown_operation(&registry, &Scope::Session("s".into())).unwrap();
+    let mut projector = Projector::default();
+    let baseline = operation.id.clone();
+    projector.observe("sessions/s", &operation, 1);
+    operation.id = "occupier".into();
+    projector.observe("sessions/s", &operation, 2);
+    operation.id = baseline;
+    projector.observe("sessions/s", &operation, 3);
+}
+
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "operation ID returned in sessions/s")]
+fn a_target_cannot_return_to_an_operation_in_its_log() {
+    let registry = registry();
+    let (mut operation, _) =
+        project::shown_operation(&registry, &Scope::Session("s".into())).unwrap();
+    let mut projector = Projector::default();
+    for (rev, id) in ["baseline", "first", "second", "first"]
+        .into_iter()
+        .enumerate()
+    {
+        operation.id = id.into();
+        projector.observe("sessions/s", &operation, rev as u64 + 1);
+    }
+}
+
+#[test]
 fn a_log_keeps_the_last_sixty_four_as_an_unbroken_chain() {
     let mut registry = registry();
     let (mut projector, mut tree) = (Projector::default(), Tree::new("i"));

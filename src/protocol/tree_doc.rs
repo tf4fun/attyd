@@ -292,6 +292,14 @@ impl Projector {
         if let Some(last) = &log.last
             && *last != operation.id
         {
+            debug_assert!(
+                !log.records.iter().any(|record| {
+                    record.id == operation.id
+                        || record.after.as_deref() == Some(operation.id.as_str())
+                }),
+                "operation ID returned in {target}: {}",
+                operation.id
+            );
             log.records.push_back(OpRecord {
                 id: operation.id.clone(),
                 after: Some(last.clone()),
