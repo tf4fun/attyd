@@ -21,6 +21,7 @@ mod login_terminals;
 mod occupation;
 mod reads;
 mod recovery;
+mod request_identity;
 mod restart;
 mod retired_v1;
 #[cfg(unix)]
