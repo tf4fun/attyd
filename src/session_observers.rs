@@ -34,9 +34,9 @@ use crate::session_registry::SessionEntry;
 pub(crate) enum SessionWork {
     /// Nothing in-flight: the unobserved countdown may arm.
     Idle,
-    /// A turn, exclusive operation, materialization attempt, live managed
-    /// terminal, or unfinished history workflow is in-flight: real work that
-    /// must not be cut off.
+    /// A turn, control request, exclusive operation, materialization attempt,
+    /// live managed terminal, or unfinished history workflow is in-flight:
+    /// real work that must not be cut off.
     Running,
     /// The Agent is parked on a user decision (permission, elicitation, or URL
     /// flow). Cancelling it changes Agent state, so it must block retirement.
@@ -62,6 +62,7 @@ impl SessionWork {
         if session.active_turn.is_some()
             || session.operation.is_some()
             || session.load_attempt.is_some()
+            || !entry.resources.control_requests.is_empty()
             || session
                 .live
                 .as_ref()

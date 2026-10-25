@@ -508,6 +508,12 @@ impl SessionRegistry {
         let candidate = std::mem::take(&mut session.attachment_candidate);
         session.controls = settle_controls(candidate, &response);
         owner.operation = None;
+        // Reload retains the allocation's other resources, but acknowledgements
+        // admitted against the previous installation no longer own its controls.
+        self.resources_mut(session_id)
+            .expect("the reloaded session owns its resources")
+            .control_requests
+            .clear();
         self.complete_session_operation(session_id, SessionOperationKind::Load, &Value::Null);
 
         Ok(())
@@ -1361,6 +1367,7 @@ impl SessionRegistry {
         Ok(())
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn complete_control_operation(
         &mut self,
@@ -4810,6 +4817,11 @@ mod tests {
     fn same_session_reload_success_does_not_create_a_second_business_session() {
         let mut state = state();
         open(&mut state, "session");
+        state
+            .resources_mut("session")
+            .unwrap()
+            .control_requests
+            .insert("old-control".into());
         let old_options = json!([{
             "type": "boolean", "id": "old-only", "name": "Old", "currentValue": false,
         }]);
@@ -4903,6 +4915,14 @@ mod tests {
                 .is_empty()
         );
         assert!(!state.operation_in_use(&operation_id));
+        assert!(
+            state
+                .resources("session")
+                .unwrap()
+                .control_requests
+                .is_empty(),
+            "a successful reload invalidates control acknowledgements from the old installation"
+        );
         assert_ne!(state.live_snapshot(), before_complete);
         assert!(
             !serde_json::to_string(&state.live_snapshot())
@@ -4952,6 +4972,11 @@ mod tests {
         let mut state = state();
         open(&mut state, "session");
         state
+            .resources_mut("session")
+            .unwrap()
+            .control_requests
+            .insert("old-control".into());
+        state
             .update_control_state(
                 "epoch",
                 "session",
@@ -4991,6 +5016,14 @@ mod tests {
                 .is_empty()
         );
         assert!(!state.operation_in_use("reload"));
+        assert!(
+            state
+                .resources("session")
+                .unwrap()
+                .control_requests
+                .contains("old-control"),
+            "a failed reload preserves the original installation's pending controls"
+        );
         assert!(
             !serde_json::to_string(&state.live_snapshot())
                 .unwrap()

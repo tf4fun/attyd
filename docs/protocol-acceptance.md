@@ -111,6 +111,28 @@ is coalesced again before delivery to check that its pending ends are still owed
 | Initial fixed-view `absent` and `replaced` ends survive the real budget overflow and repeated coalescing when the first event is unwritten; the catch-up still names the instance. Already written ends are not sent again on later traffic | `initial_fixed_view_ends_survive_catch_up_only_until_they_are_written` |
 | Replacing a history preserves its fixed view's final `replaced` end through overflow and repeated coalescing, whether its initial snapshot was written or still queued. The old output is removed, and an ordinary session path on the same stream can close and reopen without reviving or repeating the fixed view | `a_fixed_view_replaced_after_alignment_keeps_its_end_while_session_paths_can_reopen` |
 
+Independent control requests (#224, P2-3) are covered by
+[concurrent_controls.rs](../src/bridge/protocol_gate_tests/concurrent_controls.rs),
+through the real coordinator and ACP transport. Controls do not install public
+operations. Each request keeps its own resource ownership until its command finishes;
+responses fold in arrival order and a retired installation cannot accept an old response.
+
+| Boundary | Gate |
+| --- | --- |
+| Concurrent modes and configurations both reach the Agent; reverse-order successes fold in response order, and an error does not overwrite a success | `concurrent_modes_reach_the_agent_and_fold_in_response_order`, `concurrent_configs_fold_each_success_and_a_later_error_changes_nothing` |
+| Controls and a prompt progress independently, while a second prompt or fork cannot replace the running public operation | `a_prompt_and_controls_progress_independently_but_public_operations_stay_serial` |
+| A control completion ends only its own request-scoped interaction, and every action waiter and command owner is released | `each_concurrent_control_ends_only_its_own_request_scoped_interaction` |
+| A pending history installation refuses controls; once the replay installs, controls work again | `controls_resume_after_an_in_progress_history_installation` |
+| Closing and reinstalling the same session ID prevents an old response from changing the new controls | `an_old_control_response_cannot_change_a_reinstalled_session_with_the_same_id` |
+| EOF settles all controls and clears their old resource ownership; the next connection loads and accepts new controls | `eof_settles_all_controls_and_the_next_connection_has_no_old_control_work` |
+| A session without followers stays held until its last control finishes, then becomes eligible for release | `the_last_outstanding_control_keeps_an_unfollowed_session_needed` |
+
+The existing `runtime_state` cases
+`same_session_reload_success_does_not_create_a_second_business_session` and
+`same_session_reload_error_remains_actionable_and_does_not_loop` also assert that a
+successful reload invalidates old control request identities, while a failed reload
+preserves them with the original installation.
+
 The reference client's memory figures count UTF-8 window text, not the actual heap used
 by parsed JSON and replica copies. View polling below the 30-second `VIEW_LINGER` can
 receive `unchanged`; after eviction it receives a full snapshot again. These are the

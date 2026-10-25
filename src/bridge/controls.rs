@@ -66,6 +66,19 @@ pub(super) fn admit(
             format!("{scope} is busy with a {}", kind.as_str().unwrap_or("operation")),
         ));
     }
+    if !matches!(control, Control::Close)
+        && state
+            .sessions
+            .state(session_id)
+            .is_some_and(|session| session.load_attempt.is_some())
+    {
+        // Optional history replay may still be installing after the public
+        // operation completed. Preserve that transaction's control boundary.
+        return Err(refusal(
+            ErrorCode::NotAllowed,
+            format!("{scope} is loading history"),
+        ));
+    }
     let request_id = format!("action-{}", Uuid::new_v4());
     let command = match control {
         Control::Close => {
@@ -120,7 +133,32 @@ pub(super) fn admit(
     let (reply, answer) = oneshot::channel();
     if matches!(control, Control::Close) {
         state.action_closes.insert(request_id.clone(), session_id.to_string());
+    } else {
+        state
+            .sessions
+            .resources_mut(session_id)
+            .expect("a held session owns its resources")
+            .control_requests
+            .insert(request_id.clone());
+        // A parked optional history flow must not replay over this action.
+        state.sessions.supersede_history_sync(session_id);
+        refresh_observer_timers(state);
     }
     state.action_replies.insert(request_id, reply);
     Ok((command, answer))
+}
+
+/// A late result may only update the allocation that admitted its request.
+/// A close/reinstall or successful reload invalidates that ownership.
+pub(super) fn owns_request(
+    state: &BridgeState,
+    epoch: &str,
+    session_id: &str,
+    request_id: &str,
+) -> bool {
+    state.sessions.epoch() == epoch
+        && state
+            .sessions
+            .resources(session_id)
+            .is_ok_and(|resources| resources.control_requests.contains(request_id))
 }

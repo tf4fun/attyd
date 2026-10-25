@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use agent_client_protocol::schema::v1::{
     CreateElicitationResponse, ElicitationAction, RequestPermissionOutcome,
@@ -20,6 +20,9 @@ pub(crate) struct SessionResources {
     pub(crate) attachment: AttachmentDelivery,
     pub(crate) materialization: Option<MaterializationResources>,
     pub(crate) history_sync: Option<HistorySyncResources>,
+    /// Independent control actions owned by this allocation, from admission
+    /// through their command's final cleanup (including response reduction).
+    pub(crate) control_requests: HashSet<String>,
     pub(crate) permissions: HashMap<String, PermissionResponder>,
     pub(crate) elicitations: HashMap<String, ElicitationResponder>,
     pub(crate) observers: SessionObservers,
@@ -82,6 +85,7 @@ impl SessionResources {
     /// Sending a terminal result also distinguishes retirement from an accidentally
     /// dropped sender. Repeated cancellation is harmless because handles are moved.
     pub(crate) fn cancel(&mut self) {
+        self.control_requests.clear();
         for (_, permission) in self.permissions.drain() {
             let _ = permission.sender.send(RequestPermissionResponse::new(
                 RequestPermissionOutcome::Cancelled,

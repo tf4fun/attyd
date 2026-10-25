@@ -215,10 +215,18 @@ impl BridgeState {
                 .sender
                 .send(CreateElicitationResponse::new(ElicitationAction::Cancel));
         }
-        self.sessions.end_connection(ProtocolError::new(
+        let ended = ProtocolError::new(
             ErrorCode::Unavailable,
             "the Agent connection ended",
-        ));
+        );
+        // Normal command finalizers answer first. A cancelled/dropped task may
+        // leave an accepted action behind; connection teardown still settles it.
+        for (_, reply) in self.action_replies.drain() {
+            let _ = reply.send(Err(ended.clone()));
+        }
+        self.action_closes.clear();
+        self.in_flight_request_ids.clear();
+        self.sessions.end_connection(ended);
         self.hold_for_next_connection();
     }
 }
