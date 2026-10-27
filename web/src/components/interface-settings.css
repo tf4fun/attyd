@@ -1,13 +1,13 @@
 .interface-settings { position: relative; flex: 0 0 auto; }
 .interface-settings > summary {
-  display: flex; align-items: center; justify-content: center; width: 36px; height: 36px;
-  padding: 0; border: 1px solid var(--page-border); border-radius: 9px;
-  background: var(--control-surface); color: var(--control-ink); list-style: none; cursor: pointer;
+  display: flex; align-items: center; justify-content: center; width: 34px; height: 34px;
+  padding: 0; border: 0; border-radius: 10px;
+  background: transparent; color: var(--theme-text-secondary); list-style: none; cursor: pointer;
+  transition: background .14s ease, color .14s ease;
 }
 .interface-settings > summary::-webkit-details-marker { display: none; }
-.interface-settings > summary:hover, .interface-settings[open] > summary {
-  border-color: var(--control-ink); color: var(--page-ink);
-}
+.interface-settings > summary:hover { background: var(--theme-surface-hover); color: var(--theme-text-primary); }
+.interface-settings[open] > summary { background: var(--theme-accent-surface); color: var(--theme-accent-ink); }
 .interface-settings > summary:focus-visible { outline: 2px solid var(--theme-accent-border); outline-offset: 3px; }
 .interface-settings-body {
   position: absolute; z-index: 40; right: 0; top: calc(100% + 12px);
@@ -15,15 +15,14 @@
   overflow-y: auto; padding: 18px; border: 1px solid var(--page-border); border-radius: 12px;
   background: var(--page-surface); color: var(--page-ink); box-shadow: 0 14px 36px var(--theme-shadow-strong);
 }
-.interface-settings-body h2 { margin: 0 0 20px; font-size: 14px; font-weight: 600; }
+.interface-settings-body h2 { margin: 0 0 20px; font-size: 15px; font-weight: 650; }
 .interface-settings-body .language-setting { color: var(--ink-soft); }
 .interface-settings-body .language-setting > span { flex-shrink: 0; }
-.interface-settings-body p { margin: 4px 0 0; color: var(--muted); font-size: 11px; line-height: 1.5; }
+.interface-settings-body p { margin: 4px 0 0; color: var(--muted); font-size: var(--text-meta); line-height: 1.5; }
 .project-browser-header:has(.interface-settings[open]),
 .session-header:has(.interface-settings[open]) { z-index: 20; }
 @media (max-width: 760px) {
   .interface-settings { position: static; }
   .interface-settings-body { left: 0; right: 0; width: auto; max-height: min(55dvh, var(--menu-space, 55dvh)); }
-  .session-header .session-header-actions { gap: 4px; }
-  .session-header .agent-details > summary { width: 40px; gap: 5px; }
+  .interface-settings > summary { width: 32px; height: 32px; }
 }
